@@ -16,8 +16,6 @@ except (TypeError, ValueError):
 
 IS_PROD_ENV = NETUID == DEFAULT_NETUID
 
-MINER_DOCKER_IMAGE = "weightswandering/tuning_miner:latest"
-MINER_DOCKER_IMAGE_DIFFUSION = "diagonalge/miner-diffusion-flux:latest"
 VALIDATOR_DOCKER_IMAGE = "weightswandering/tuning_vali:latest"
 VALIDATOR_DOCKER_IMAGE_DIFFUSION = "diagonalge/tuning_validator_diffusion:latest"
 
@@ -51,12 +49,10 @@ HUGGINGFACE_TOKEN = os.getenv("HUGGINGFACE_TOKEN")
 WANDB_TOKEN = os.getenv("WANDB_TOKEN")
 
 HUGGINGFACE_USERNAME = os.getenv("HUGGINGFACE_USERNAME")
-RAYONLABS_HF_USERNAME = "rayonlabs"
-
-CUSTOM_DATASET_TYPE = "custom"
+RAYONLABS_HF_USERNAME = "gradients-io-tournaments"  # "besimray"  # "rayonlabs"
 
 # DPO default dataset type
-DPO_DEFAULT_DATASET_TYPE = "chatml.default" 
+DPO_DEFAULT_DATASET_TYPE = "chatml.default"
 # Field names must match exactly what Axolotl's formatter expects
 DPO_DEFAULT_FIELD_PROMPT = "question"  # chatml.intel expects 'question'
 DPO_DEFAULT_FIELD_SYSTEM = "system"
@@ -64,3 +60,9 @@ DPO_DEFAULT_FIELD_CHOSEN = "chosen"
 DPO_DEFAULT_FIELD_REJECTED = "rejected"
 
 GRPO_DEFAULT_FIELD_PROMPT = "prompt"
+
+# YaRN extension HuggingFace credentials (separate from main HF credentials)
+YARN_HUGGINGFACE_USERNAME = os.getenv("YARN_HUGGINGFACE_USERNAME", "gradients-io")
+YARN_HUGGINGFACE_TOKEN = os.getenv("YARN_HUGGINGFACE_TOKEN")
+
+YARN_VALID_FACTORS = [2, 4, 8, 16, 32]

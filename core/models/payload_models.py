@@ -1,5 +1,3 @@
-import ast
-import hashlib
 from datetime import datetime
 from uuid import UUID
 from uuid import uuid4
@@ -8,15 +6,12 @@ from fiber.logging_utils import get_logger
 from pydantic import BaseModel
 from pydantic import ConfigDict
 from pydantic import Field
+from pydantic import field_validator
 from pydantic import model_validator
 
 from core import constants as cst
-
-from core.models.utility_models import DpoDatasetType
-from core.models.utility_models import TextDatasetType
 from core.models.utility_models import FileFormat
 from core.models.utility_models import GrpoDatasetType
-from core.models.utility_models import ChatTemplateDatasetType
 from core.models.utility_models import ImageModelType
 from core.models.utility_models import ImageTextPair
 from core.models.utility_models import JobStatus
@@ -169,6 +164,19 @@ class NewTaskRequest(BaseModel):
     account_id: UUID
     hours_to_complete: float = Field(..., description="The number of hours to complete the task", examples=[1])
     result_model_name: str | None = Field(None, description="The name to give to a model that is created by this task")
+    backend: str = Field(default="oblivus", description="The backend to use for training: 'oblivus' or 'runpod'", examples=["runpod", "oblivus"])
+    yarn_factor: int | None = Field(None, description=f"YaRN extension factor for extending context length (powers of 2: {cst.YARN_VALID_FACTORS})", examples=[2, 4, 8, 16])
+
+    @field_validator("yarn_factor")
+    @classmethod
+    def validate_yarn_factor(cls, v: int | None) -> int | None:
+        if v is None:
+            return v
+        if not isinstance(v, int):
+            raise ValueError("yarn_factor must be an integer")
+        if v not in cst.YARN_VALID_FACTORS:
+            raise ValueError(f"yarn_factor must be a power of 2: {cst.YARN_VALID_FACTORS}")
+        return v
 
 
 class NewTaskRequestInstructText(NewTaskRequest):
@@ -259,8 +267,18 @@ class NewTaskRequestDPO(NewTaskRequest):
         return values
 
 
+class RewardFunctionReference(BaseModel):
+    """Model representing a reference to a reward function by ID"""
+
+    reward_id: str = Field(
+        ..., description="UUID of the reward function in the database", examples=["550e8400-e29b-41d4-a716-446655440000"]
+    )
+    reward_weight: float = Field(..., ge=0, description="Weight for this reward function")
+
+
 class NewTaskRequestGrpo(NewTaskRequest):
     field_prompt: str = Field(..., description="The column name for the prompt", examples=["prompt"])
+    extra_column: str | None = Field(None, description="The column name for the extra data", examples=["extra_data"])
 
     ds_repo: str = Field(..., description="The repository for the dataset", examples=["trl-lib/tldr"])
     file_format: FileFormat = Field(
@@ -268,7 +286,7 @@ class NewTaskRequestGrpo(NewTaskRequest):
     )
     model_repo: str = Field(..., description="The repository for the model", examples=["Qwen/Qwen2.5-Coder-32B-Instruct"])
 
-    reward_functions: list[RewardFunction]
+    reward_functions: list[RewardFunctionReference]
 
     # Turn off protected namespace for model
     model_config = ConfigDict(protected_namespaces=())
@@ -287,44 +305,6 @@ class NewTaskRequestGrpo(NewTaskRequest):
             raise ValueError("reward_functions must not be empty")
         return self
 
-    @model_validator(mode="after")
-    def validate_reward_functions(self) -> "NewTaskRequestGrpo":
-        for reward_function in self.reward_functions:
-            try:
-                # Check if it's valid Python code
-                parsed = ast.parse(reward_function.reward_func)
-
-                # Check if it contains a function definition
-                function_found = False
-                for node in ast.walk(parsed):
-                    if isinstance(node, ast.FunctionDef):
-                        function_found = True
-                        arg_names = [arg.arg for arg in node.args.args]
-                        has_completions = "completions" in arg_names
-                        has_kwargs = node.args.kwarg is not None
-
-                        if not has_completions:
-                            raise ValueError(f"Reward function {node.name} must have a 'completions' parameter")
-                        if not has_kwargs:
-                            raise ValueError(f"Reward function {node.name} must have a '**kwargs' parameter")
-
-                        if reward_function.is_generic is None:
-                            allowed_params = {"completions", "prompts"}
-                            reward_function.is_generic = set(arg_names) <= allowed_params
-
-                        if reward_function.func_hash is None:
-                            reward_function.func_hash = hashlib.sha256(reward_function.reward_func.encode()).hexdigest()
-
-                        break
-
-                if not function_found:
-                    raise ValueError("Each reward function must be a proper Python function")
-
-            except Exception as e:
-                raise ValueError(f"Invalid Python syntax: {reward_function.reward_func[:50]}... {e}")
-
-        return self
-
 
 class NewTaskRequestImage(NewTaskRequest):
     model_config = ConfigDict(protected_namespaces=())
@@ -341,17 +321,16 @@ class NewTaskRequestImage(NewTaskRequest):
     model_type: ImageModelType = ImageModelType.SDXL
 
 
-class NewTaskWithFixedDatasetsRequest(NewTaskRequestInstructText):
+class NewTaskWithCustomDatasetRequest(NewTaskRequestInstructText):
     ds_repo: str | None = Field(None, description="Optional: The original repository of the dataset")
+    training_data: str = Field(..., description="The prepared training dataset")
+    test_data: str | None = Field(None, description="The prepared test dataset")
     file_format: FileFormat = Field(
         FileFormat.S3, description="The format of the dataset", examples=[FileFormat.HF, FileFormat.S3]
     )
-    training_data: str = Field(..., description="The prepared training dataset")
-    synthetic_data: str = Field(..., description="The prepared synthetic dataset")
-    test_data: str = Field(..., description="The prepared test dataset")
 
 
-class NewTaskWithCustomDatasetRequest(NewTaskRequestInstructText):
+class NewTaskWithCustomDatasetRequestChat(NewTaskRequestChat):
     ds_repo: str | None = Field(None, description="Optional: The original repository of the dataset")
     training_data: str = Field(..., description="The prepared training dataset")
     test_data: str | None = Field(None, description="The prepared test dataset")
@@ -409,6 +388,24 @@ class InstructTextTaskDetails(TaskDetails):
         None, description="If the field_input is not provided, what format should we use? ", examples=["{instruction}"]
     )
     system_format: None = Field(None, description="How to format the `system (prompt)`", examples=["{system}"])
+
+    # Turn off protected namespace for model
+    model_config = ConfigDict(protected_namespaces=())
+
+
+class ChatTaskDetails(TaskDetails):
+    task_type: TaskType = TaskType.CHATTASK
+    base_model_repository: str
+    ds_repo: str
+
+    chat_template: str = Field(..., description="The chat template used", examples=["chatml"])
+    chat_column: str | None = Field(None, description="The column name for the chat conversations", examples=["conversations"])
+    chat_role_field: str = Field(..., description="The column name to specify the role in the conversation ", examples=["from"])
+    chat_content_field: str = Field(..., description="The column name to specify the text content", examples=["value"])
+    chat_user_reference: str | None = Field(None, description="The column name to specify the user", examples=["user"])
+    chat_assistant_reference: str | None = Field(
+        None, description="The column name to specify the assistant", examples=["assistant"]
+    )
 
     # Turn off protected namespace for model
     model_config = ConfigDict(protected_namespaces=())
@@ -489,5 +486,88 @@ class TournamentGpuRequirementsResponse(BaseModel):
     total_hours: float
 
 
+class BenchmarkResult(BaseModel):
+    """Individual benchmark result for a participant"""
+
+    copy_task_id: str
+    participant_hotkey: str
+    tournament_id: str | None
+    quality_score: float
+    test_loss: float | None
+    synth_loss: float | None
+    repo: str | None
+    completed_at: datetime | None
+    created_at: datetime
+    model_id: str
+    dataset: str
+    task_type: str
+
+
+class BenchmarkRootTaskResults(BaseModel):
+    """Results for a specific benchmark root task"""
+
+    root_task_id: str
+    model_id: str
+    dataset: str
+    task_type: str
+    results: list[BenchmarkResult]
+
+
+class RewardFunctionInfo(BaseModel):
+    reward_id: str = Field(..., description="UUID of the reward function in the database")
+    name: str
+    description: str
+    code: str
+
+
+class RewardFunctionsResponse(BaseModel):
+    reward_functions: dict[str, RewardFunctionInfo]
+
+
+class AddRewardFunctionRequest(BaseModel):
+    name: str
+    description: str
+    code: str
+    reward_weight: float | None = None
+
+
 # Type alias for task details types
-AnyTypeTaskDetails = InstructTextTaskDetails | ImageTaskDetails | DpoTaskDetails | GrpoTaskDetails
+AnyTypeTaskDetails = InstructTextTaskDetails | ChatTaskDetails| ImageTaskDetails | DpoTaskDetails | GrpoTaskDetails
+
+
+class DstackRunStatus(BaseModel):
+    """Dstack run status response model"""
+    status: str = Field(..., description="Run status: submitted, provisioning, running, done, failed, aborted, terminated")
+    latest_job_submission: dict | None = None
+    
+    def get_status(self) -> str:
+        """Get the status string, handling both string and dict formats"""
+        if isinstance(self.status, dict):
+            return self.status.get("status", "Unknown")
+        return str(self.status)
+    
+    def is_provisioning(self) -> bool:
+        """Check if run is in provisioning state"""
+        status = self.get_status().lower()
+        return "provisioning" in status or "submitted" in status
+    
+    def is_running(self) -> bool:
+        """Check if run is in running state"""
+        status = self.get_status().lower()
+        return "running" in status
+    
+    def is_done(self) -> bool:
+        """Check if run is done (successfully completed)"""
+        status = self.get_status().lower()
+        return status == "done"
+    
+    def is_failed(self) -> bool:
+        """Check if run has failed"""
+        status = self.get_status().lower()
+        return status in ["failed", "aborted", "terminated"]
+
+    def got_no_offers(self) -> bool:
+        """Check if run got no offers"""
+        if self.latest_job_submission is None:
+            return False
+        return self.latest_job_submission.get("status_message", "Unknown") == "no offers"

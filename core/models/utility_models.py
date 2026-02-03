@@ -81,6 +81,7 @@ class InstructTextDatasetType(BaseModel):
 class RewardFunction(BaseModel):
     """Model representing a reward function with its metadata"""
 
+    reward_id: str | None = Field(None, description="UUID of the reward function in the database")
     reward_func: str = Field(
         ...,
         description="String with the python code of the reward function to use",
@@ -93,11 +94,13 @@ class RewardFunction(BaseModel):
     reward_weight: float = Field(..., ge=0)
     func_hash: str | None = None
     is_generic: bool | None = None
+    is_manual: bool | None = None
 
 
 class GrpoDatasetType(BaseModel):
     field_prompt: str | None = None
     reward_functions: list[RewardFunction] | None = []
+    extra_column: str | None = None
 
 
 class DpoDatasetType(BaseModel):
@@ -108,7 +111,7 @@ class DpoDatasetType(BaseModel):
     prompt_format: str | None = "{prompt}"
     chosen_format: str | None = "{chosen}"
     rejected_format: str | None = "{rejected}"
-    
+
 
 class ChatTemplateDatasetType(BaseModel):
     chat_template: str | None = "chatml"
@@ -200,6 +203,11 @@ class TrainingStatus(str, Enum):
     TRAINING = "training"
     SUCCESS = "success"
     FAILURE = "failure"
+
+
+class Backend(str, Enum):
+    OBLIVUS = "oblivus"
+    RUNPOD = "runpod"
 
 
 class GPUInfo(BaseModel):

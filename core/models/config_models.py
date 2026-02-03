@@ -13,12 +13,8 @@ class BaseConfig:
 
 @dataclass
 class MinerConfig(BaseConfig):
-    wandb_token: str
-    huggingface_username: str
-    huggingface_token: str
     min_stake_threshold: str
     refresh_nodes: bool
-    is_validator: bool = False
 
 
 @dataclass
@@ -45,6 +41,7 @@ class ValidatorConfig(BaseConfig):
     refresh_nodes: bool = True
     database_url: str | None = None
     postgres_profile: str = "default"
+    discord_webhook: str | None = None
 
 
 @dataclass

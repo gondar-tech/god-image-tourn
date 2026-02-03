@@ -1,5 +1,4 @@
 import asyncio
-import base64
 import json
 import os
 import random
@@ -30,9 +29,9 @@ from validator.tasks.task_prep import upload_file_to_minio
 from validator.utils.call_endpoint import post_to_nineteen_image
 from validator.utils.llm import convert_to_nineteen_payload
 from validator.utils.llm import post_to_nineteen_chat_with_reasoning
+from validator.utils.logging import get_all_context_tags
 from validator.utils.logging import get_logger
 from validator.utils.logging import stream_container_logs
-from validator.utils.logging import get_all_context_tags
 from validator.utils.util import retry_with_backoff
 
 
@@ -228,8 +227,8 @@ async def generate_image(prompt: str, keypair: Keypair, width: int, height: int)
     payload = {
         "prompt": prompt,
         "model": cst.IMAGE_GEN_MODEL,
-        "steps": cst.IMAGE_GEN_STEPS,
-        "cfg_scale": cst.IMAGE_GEN_CFG_SCALE,
+        "num_inference_steps": cst.IMAGE_GEN_STEPS,
+        "guidance_scale": cst.IMAGE_GEN_CFG_SCALE,
         "height": height,
         "width": width,
         "negative_prompt": "",
@@ -238,8 +237,8 @@ async def generate_image(prompt: str, keypair: Keypair, width: int, height: int)
     result = await post_to_nineteen_image(payload, keypair)
 
     try:
-        result_dict = json.loads(result) if isinstance(result, str) else result
-        return result_dict["image_b64"]
+        image_bytes = result.content
+        return image_bytes
     except (json.JSONDecodeError, KeyError) as e:
         logger.error(f"Error parsing image generation response: {e}")
         raise ValueError("Failed to generate image")
@@ -289,36 +288,18 @@ async def generate_style_synthetic(config: Config, num_prompts: int) -> tuple[li
     except Exception as e:
         logger.error(f"Failed to generate prompts for {first_style} and {second_style}: {e}")
         raise e
-    image_text_pairs = []
-    for i, prompt in enumerate(prompts):
-        width = random.randrange(cst.MIN_IMAGE_WIDTH, cst.MAX_IMAGE_WIDTH + 1, cst.IMAGE_RESOLUTION_STEP)
-        height = random.randrange(cst.MIN_IMAGE_HEIGHT, cst.MAX_IMAGE_HEIGHT + 1, cst.IMAGE_RESOLUTION_STEP)
-        image = await generate_image(prompt, config.keypair, width, height)
 
-        with tempfile.NamedTemporaryFile(dir=cst.TEMP_PATH_FOR_IMAGES, suffix=".png") as img_file:
-            img_file.write(base64.b64decode(image))
-            img_url = await upload_file_to_minio(img_file.name, cst.BUCKET_NAME, f"{os.urandom(8).hex()}_{i}.png")
-
-        with tempfile.NamedTemporaryFile(suffix=".txt") as txt_file:
-            txt_file.write(prompt.encode())
-            txt_file.flush()
-            txt_file.seek(0)
-            txt_url = await upload_file_to_minio(txt_file.name, cst.BUCKET_NAME, f"{os.urandom(8).hex()}_{i}.txt")
-
-        image_text_pairs.append(ImageTextPair(image_url=img_url, text_url=txt_url))
-
-    return image_text_pairs, ds_prefix
-
-
-async def generate_person_synthetic(num_prompts: int) -> tuple[list[ImageTextPair], str]:
     client = docker.from_env()
     image_text_pairs = []
     with tempfile.TemporaryDirectory(dir=cst.TEMP_PATH_FOR_IMAGES) as tmp_dir_path:
         container = await asyncio.to_thread(
             client.containers.run,
-            image=cst.PERSON_SYNTH_DOCKER_IMAGE,
-            environment={"SAVE_DIR": cst.PERSON_SYNTH_CONTAINER_SAVE_PATH, "NUM_PROMPTS": num_prompts},
-            volumes={tmp_dir_path: {"bind": cst.PERSON_SYNTH_CONTAINER_SAVE_PATH, "mode": "rw"}},
+            image=cst.IMAGE_SYNTH_DOCKER_IMAGE,
+            environment={
+                "SAVE_DIR": cst.SYNTH_CONTAINER_SAVE_PATH,
+                "PROMPTS": json.dumps(prompts),
+            },
+            volumes={tmp_dir_path: {"bind": cst.SYNTH_CONTAINER_SAVE_PATH, "mode": "rw"}},
             device_requests=[docker.types.DeviceRequest(capabilities=[["gpu"]], device_ids=["0"])],
             detach=True,
         )
@@ -330,12 +311,41 @@ async def generate_person_synthetic(num_prompts: int) -> tuple[list[ImageTextPai
             if file.is_file() and file.suffix == ".png":
                 txt_path = images_dir / f"{file.stem}.txt"
                 if txt_path.exists() and txt_path.stat().st_size > 0:
-                    img_url = await upload_file_to_minio(
-                        str(file), cst.BUCKET_NAME, f"{os.urandom(8).hex()}.png"
-                    )
-                    txt_url = await upload_file_to_minio(
-                        str(txt_path), cst.BUCKET_NAME, f"{os.urandom(8).hex()}.txt"
-                    )
+                    img_url = await upload_file_to_minio(str(file), cst.BUCKET_NAME, f"{os.urandom(8).hex()}.png")
+                    txt_url = await upload_file_to_minio(str(txt_path), cst.BUCKET_NAME, f"{os.urandom(8).hex()}.txt")
+                    image_text_pairs.append(ImageTextPair(image_url=img_url, text_url=txt_url))
+        if os.path.exists(tmp_dir_path):
+            shutil.rmtree(tmp_dir_path)
+
+    await asyncio.to_thread(client.containers.prune)
+    await asyncio.to_thread(client.images.prune, filters={"dangling": True})
+    await asyncio.to_thread(client.volumes.prune)
+
+    return image_text_pairs, ds_prefix
+
+
+async def generate_person_synthetic(num_prompts: int) -> tuple[list[ImageTextPair], str]:
+    client = docker.from_env()
+    image_text_pairs = []
+    with tempfile.TemporaryDirectory(dir=cst.TEMP_PATH_FOR_IMAGES) as tmp_dir_path:
+        container = await asyncio.to_thread(
+            client.containers.run,
+            image=cst.IMAGE_SYNTH_DOCKER_IMAGE,
+            environment={"SAVE_DIR": cst.SYNTH_CONTAINER_SAVE_PATH, "NUM_PROMPTS": num_prompts},
+            volumes={tmp_dir_path: {"bind": cst.SYNTH_CONTAINER_SAVE_PATH, "mode": "rw"}},
+            device_requests=[docker.types.DeviceRequest(capabilities=[["gpu"]], device_ids=["0"])],
+            detach=True,
+        )
+        log_task = asyncio.create_task(asyncio.to_thread(stream_container_logs, container, get_all_context_tags()))
+        result = await asyncio.to_thread(container.wait)
+        log_task.cancel()
+        images_dir = Path(tmp_dir_path)
+        for file in images_dir.iterdir():
+            if file.is_file() and file.suffix == ".png":
+                txt_path = images_dir / f"{file.stem}.txt"
+                if txt_path.exists() and txt_path.stat().st_size > 0:
+                    img_url = await upload_file_to_minio(str(file), cst.BUCKET_NAME, f"{os.urandom(8).hex()}.png")
+                    txt_url = await upload_file_to_minio(str(txt_path), cst.BUCKET_NAME, f"{os.urandom(8).hex()}.txt")
                     image_text_pairs.append(ImageTextPair(image_url=img_url, text_url=txt_url))
         if os.path.exists(tmp_dir_path):
             shutil.rmtree(tmp_dir_path)
@@ -355,7 +365,7 @@ async def create_synthetic_image_task(config: Config, models: AsyncGenerator[Ima
     model_info = await anext(models)
     Path(cst.TEMP_PATH_FOR_IMAGES).mkdir(parents=True, exist_ok=True)
     is_flux_model = model_info.model_type == ImageModelType.FLUX
-    if (random.random() < cst.PERCENTAGE_OF_IMAGE_SYNTHS_SHOULD_BE_STYLE) and not is_flux_model:
+    if random.random() < cst.PERCENTAGE_OF_IMAGE_SYNTHS_SHOULD_BE_STYLE:
         image_text_pairs, ds_prefix = await generate_style_synthetic(config, num_prompts)
     else:
         # Try person synth with a few retries for insufficient pairs
@@ -366,8 +376,14 @@ async def create_synthetic_image_task(config: Config, models: AsyncGenerator[Ima
             elif attempt < cst.PERSON_GEN_RETRIES - 1:
                 logger.info(f"Person synth generation only produced {len(image_text_pairs)} pairs, trying again...")
             else:
-                logger.warning(f"Person synth generation only produced {len(image_text_pairs)} pairs after {cst.PERSON_GEN_RETRIES} attempts")
+                logger.warning(
+                    f"Person synth generation only produced {len(image_text_pairs)} pairs after {cst.PERSON_GEN_RETRIES} attempts"
+                )
 
+    # Log image and text URLs for testing
+    logger.info(f"Generated {len(image_text_pairs)} image-text pairs with prefix: {ds_prefix}")
+    for i, pair in enumerate(image_text_pairs):
+        logger.info(f"Pair {i+1} - Image URL: {pair.image_url}, Text URL: {pair.text_url}")
 
     if len(image_text_pairs) >= 10:
         task = ImageRawTask(

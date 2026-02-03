@@ -12,10 +12,12 @@ from pydantic import Field
 from pydantic import field_validator
 from pydantic import model_validator
 
+from core.constants import YARN_VALID_FACTORS
+from core.models.utility_models import Backend
+from core.models.utility_models import ChatTemplateDatasetType
 from core.models.utility_models import DpoDatasetType
 from core.models.utility_models import FileFormat
 from core.models.utility_models import GrpoDatasetType
-from core.models.utility_models import ChatTemplateDatasetType
 from core.models.utility_models import ImageModelType
 from core.models.utility_models import ImageTextPair
 from core.models.utility_models import InstructTextDatasetType
@@ -103,9 +105,22 @@ class RawTask(BaseModel):
     n_eval_attempts: int = 0
     task_type: TaskType
     model_params_count: int = 0
+    backend: Backend | None = None
+    yarn_factor: int | None = None
 
     # Turn off protected namespace for model
     model_config = ConfigDict(protected_namespaces=())
+
+    @field_validator("yarn_factor")
+    @classmethod
+    def validate_yarn_factor(cls, v: int | None) -> int | None:
+        if v is None:
+            return v
+        if not isinstance(v, int):
+            raise ValueError("yarn_factor must be an integer")
+        if v not in YARN_VALID_FACTORS:
+            raise ValueError(f"yarn_factor must be a power of 2: {YARN_VALID_FACTORS}")
+        return v
 
 
 class DpoRawTask(RawTask):
@@ -120,9 +135,9 @@ class DpoRawTask(RawTask):
     prompt_format: str | None = None
     chosen_format: str | None = None
     rejected_format: str | None = None
-    synthetic_data: str | None = None
     file_format: FileFormat = FileFormat.HF
     task_type: TaskType = TaskType.DPOTASK
+    synthetic_data: str | None = None
 
 
 class GrpoRawTask(RawTask):
@@ -134,6 +149,7 @@ class GrpoRawTask(RawTask):
     reward_functions: list[RewardFunction]
     file_format: FileFormat = FileFormat.HF
     task_type: TaskType = TaskType.GRPOTASK
+    extra_column: str | None = None
     synthetic_data: str | None = None
 
     @model_validator(mode="after")
@@ -156,9 +172,9 @@ class InstructTextRawTask(RawTask):
     format: str | None = None
     no_input_format: str | None = None
     system_format: None = None  # NOTE: Needs updating to be optional once we accept it
-    synthetic_data: str | None = None
     file_format: FileFormat = FileFormat.HF
     task_type: TaskType = TaskType.INSTRUCTTEXTTASK
+    synthetic_data: str | None = None
 
 
 class ChatRawTask(RawTask):
@@ -172,9 +188,9 @@ class ChatRawTask(RawTask):
     chat_content_field: str | None = "value"
     chat_user_reference: str | None = "user"
     chat_assistant_reference: str | None = "assistant"
-    synthetic_data: str | None = None
     file_format: FileFormat = FileFormat.HF
     task_type: TaskType = TaskType.CHATTASK
+    synthetic_data: str | None = None
 
 
 class ImageRawTask(RawTask):
@@ -307,7 +323,7 @@ class MinerResultsText(MinerResults):
     @field_validator("task_type")
     def validate_task_type(cls, v):
         if v not in {TaskType.INSTRUCTTEXTTASK, TaskType.DPOTASK, TaskType.GRPOTASK, TaskType.CHATTASK}:
-            raise ValueError("Must be INSTRUCTTEXTTASK, DPOTASK or GRPOTASK")
+            raise ValueError("Must be INSTRUCTTEXTTASK, CHATTASK, DPOTASK or GRPOTASK")
         return v
 
 
@@ -358,7 +374,6 @@ class AllNodeStats(BaseModel):
 
 class DatasetUrls(BaseModel):
     test_url: str
-    synthetic_url: str | None = None
     train_url: str
 
 
@@ -371,13 +386,11 @@ class DatasetFiles(BaseModel):
 class DatasetJsons(BaseModel):
     train_data: list[Any]
     test_data: list[Any]
-    synthetic_data: list[Any] = Field(default_factory=list)
 
     def to_json_strings(self) -> dict[str, str]:
         return {
             "train_data": json.dumps(self.train_data),
             "test_data": json.dumps(self.test_data),
-            "synthetic_data": json.dumps(self.synthetic_data) if self.synthetic_data else "",
         }
 
 
@@ -391,6 +404,7 @@ class Img2ImgPayload(BaseModel):
     height: int = 1024
     width: int = 1024
     model_type: str = "sdxl"
+    seed: int | None = None
     is_safetensors: bool = True
     prompt: str | None = None
     base_image: str | None = None
@@ -491,6 +505,8 @@ class EvaluationArgs(BaseModel):
                 data = json.loads(value)
                 if "field_instruction" in data and "field_input" in data:
                     return InstructTextDatasetType.model_validate(data)
+                elif "chat_column" in data:
+                    return ChatTemplateDatasetType.model_validate(data)  # TODO correct?
                 elif "field_chosen" in data:
                     return DpoDatasetType.model_validate(data)
                 elif "reward_functions" in data:
@@ -505,5 +521,9 @@ AnyTextTypeRawTask = InstructTextRawTask | DpoRawTask | GrpoRawTask | ChatRawTas
 AnyTypeRawTask = AnyTextTypeRawTask | ImageRawTask
 AnyTypeTask = InstructTextTask | DpoTask | ImageTask | GrpoTask | ChatTask
 AnyTypeTaskWithHotkeyDetails = (
-    InstructTextTaskWithHotkeyDetails | ImageTaskWithHotkeyDetails | DpoTaskWithHotkeyDetails | GrpoTaskWithHotkeyDetails | ChatTaskWithHotkeyDetails
+    InstructTextTaskWithHotkeyDetails
+    | ImageTaskWithHotkeyDetails
+    | DpoTaskWithHotkeyDetails
+    | GrpoTaskWithHotkeyDetails
+    | ChatTaskWithHotkeyDetails
 )

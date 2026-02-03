@@ -1,37 +1,33 @@
-"""
-Calculates and schedules weights every SCORING_PERIOD
-"""
-
 import asyncio
 import os
 from datetime import datetime
-from datetime import timedelta
-from datetime import timezone
 
 from dotenv import load_dotenv
 
+from core.models.tournament_models import NodeWeightsResult
 from core.models.tournament_models import TournamentAuditData
+from core.models.tournament_models import TournamentBurnData
+from core.models.tournament_models import TournamentData
+from core.models.tournament_models import TournamentResults
 from core.models.tournament_models import TournamentResultsWithWinners
 from core.models.tournament_models import TournamentType
-from core.models.utility_models import TaskType
 from validator.db.sql.auditing import store_latest_scores_url
-
-from validator.db.sql.submissions_and_scoring import get_aggregate_scores_for_leaderboard_since
-from validator.db.sql.submissions_and_scoring import get_aggregate_scores_since
-from validator.db.sql.tournament_performance import get_boss_round_synthetic_task_completion
-from validator.db.sql.tournament_performance import get_boss_round_winner_task_pairs
-from validator.db.sql.tournament_performance import get_previous_completed_tournament
-from validator.db.sql.tournament_performance import get_task_scores_as_models
+from validator.db.sql.tournaments import count_champion_consecutive_wins
 from validator.db.sql.tournaments import get_active_tournament_participants
 from validator.db.sql.tournaments import get_latest_completed_tournament
 from validator.db.sql.tournaments import get_tournament_full_results
+from validator.db.sql.tournaments import get_tournament_where_champion_first_won
+from validator.db.sql.tournaments import get_weekly_task_participation_data
 from validator.evaluation.tournament_scoring import get_tournament_weights_from_data
-
+from validator.tournament.performance_calculator import calculate_performance_difference
+from validator.tournament.utils import did_winner_change
+from validator.tournament.utils import get_real_tournament_winner
 
 
 load_dotenv(os.getenv("ENV_FILE", ".vali.env"))
 
 import json
+from datetime import timezone
 from uuid import UUID
 
 from fiber.chain import fetch_nodes
@@ -45,10 +41,7 @@ from core import constants as ccst
 from core.constants import BUCKET_NAME
 from validator.core.config import Config
 from validator.core.config import load_config
-from validator.core.models import PeriodScore
-from validator.core.models import TaskResults
 from validator.db.sql.nodes import get_vali_node_id
-from validator.evaluation.scoring import get_period_scores_from_results
 from validator.utils.logging import get_logger
 from validator.utils.util import save_json_to_temp_file
 from validator.utils.util import try_db_connections
@@ -58,249 +51,7 @@ from validator.utils.util import upload_file_to_minio
 logger = get_logger(__name__)
 
 
-TIME_PER_BLOCK: int = 500
-
-
-def get_organic_proportion(task_results: list[TaskResults], task_types: TaskType | set[TaskType], days: int) -> float:
-    cutoff_date = datetime.now(timezone.utc) - timedelta(days=days)
-
-    if isinstance(task_types, set):
-        type_set = task_types
-    else:
-        type_set = {task_types}
-
-
-    specific_type_tasks = [i for i in task_results if i.task.created_at > cutoff_date and i.task.task_type in type_set]
-
-
-    organic_count = sum(1 for task in specific_type_tasks if task.task.is_organic)
-    total_count = len(specific_type_tasks)
-
-    logger.info(f"The total count is {total_count} with organic_count {organic_count} for types {type_set}")
-
-    organic_proportion = organic_count / total_count if total_count > 0 else 0.0
-    logger.info(f"THE ORGANIC PROPORTION RIGHT NOW IS {organic_proportion}")
-    return organic_proportion
-
-
-def detect_suspicious_nodes(task_results: list[TaskResults], task_types: TaskType | set[TaskType], days: int = 7) -> set[str]:
-    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
-
-    if isinstance(task_types, set):
-        type_set = task_types
-    else:
-        type_set = {task_types}
-
-    period_tasks_organic = [
-        task
-        for task in task_results
-        if task.task.task_type in type_set and task.task.is_organic and task.task.created_at > cutoff
-    ]
-
-    period_tasks_synth = [
-        task
-        for task in task_results
-        if task.task.task_type in type_set and not task.task.is_organic and task.task.created_at > cutoff
-    ]
-
-    # Get scores for comparison
-    organic_scores = get_period_scores_from_results(
-        period_tasks_organic,
-        weight_multiplier=1.0,  # Temporary multiplier just for comparison
-    )
-
-    synth_scores = get_period_scores_from_results(
-        period_tasks_synth,
-        weight_multiplier=1.0,  # Temporary multiplier just for comparison
-    )
-
-    # Count synth jobs per hotkey
-    synth_job_counts = {}
-    for task in period_tasks_synth:
-        for node_score in task.node_scores:
-            if node_score.hotkey not in synth_job_counts:
-                synth_job_counts[node_score.hotkey] = 0
-            synth_job_counts[node_score.hotkey] += 1
-
-    suspicious_hotkeys = set()
-    synth_by_hotkey = {score.hotkey: score for score in synth_scores}
-
-    for organic_score in organic_scores:
-        hotkey = organic_score.hotkey
-        synth_job_count = synth_job_counts.get(hotkey, 0)
-
-        min_required_synth_jobs = cts.MIN_SYNTH_JOBS_REQUIRED_PER_DAY * days
-        if synth_job_count < min_required_synth_jobs:
-            logger.info(
-                f"Node {hotkey} has only {synth_job_count} synth jobs (requires {min_required_synth_jobs} for {days} days) "
-                f"for {type_set} in {days}-day period - flagging as suspicious"
-            )
-            suspicious_hotkeys.add(hotkey)
-        elif hotkey in synth_by_hotkey:
-            synth_score = synth_by_hotkey[hotkey]
-            if organic_score.average_score > (synth_score.average_score + 0.5 * synth_score.std_score):
-                logger.info(
-                    f"Node {hotkey} has a much higher organic vs synth score "
-                    f"for {type_set} in {days}-day period - flagging as suspicious"
-                )
-                suspicious_hotkeys.add(hotkey)
-        else:
-            logger.info(
-                f"Node {hotkey} has organic scores but no synth scores "
-                f"for {task_types} in {days}-day period - flagging as suspicious"
-            )
-            suspicious_hotkeys.add(hotkey)
-
-    return suspicious_hotkeys
-
-
-def get_period_scores_from_task_results(task_results: list[TaskResults]) -> list[PeriodScore]:
-    """Process task results into period scores with appropriate filtering and weighting."""
-    if not task_results:
-        logger.info("There were no results to be scored")
-        return []
-
-    task_types = [
-        {"type": {TaskType.INSTRUCTTEXTTASK, TaskType.CHATTASK}, "weight_key": "INSTRUCT_TEXT_TASK_SCORE_WEIGHT"},
-        {"type": TaskType.DPOTASK, "weight_key": "DPO_TASK_SCORE_WEIGHT"},
-        {"type": TaskType.IMAGETASK, "weight_key": "IMAGE_TASK_SCORE_WEIGHT"},
-        {"type": TaskType.GRPOTASK, "weight_key": "GRPO_TASK_SCORE_WEIGHT"},
-    ]
-
-    organic_proportions = {}
-    suspicious_hotkeys = {}
-
-    for task_config in task_types:
-        task_types_raw = task_config["type"]
-        weight_key = task_config["weight_key"]
-
-        task_type_list = task_types_raw if isinstance(task_types_raw, set) else [task_types_raw]
-
-        task_types_key = str(sorted(task_type_list)) if len(task_type_list) > 1 else str(task_type_list[0])
-
-        organic_proportions[task_types_key] = get_organic_proportion(
-            task_results, set(task_type_list) if len(task_type_list) > 1 else task_type_list[0], days=7
-        )
-
-        suspicious_hotkeys[task_types_key] = detect_suspicious_nodes(
-            task_results, set(task_type_list) if len(task_type_list) > 1 else task_type_list[0], days=7
-        )
-
-        logger.info(f"Found {len(suspicious_hotkeys[task_types_key])} suspicious nodes for {task_types_key}")
-
-    filtered_tasks = {}
-
-    for task_config in task_types:
-        task_types_raw = task_config["type"]
-        task_type_list = task_types_raw if isinstance(task_types_raw, set) else [task_types_raw]
-
-        task_types_key = str(sorted(task_type_list)) if len(task_type_list) > 1 else str(task_type_list[0])
-
-        organic_tasks = []
-        synth_tasks = []
-        for task_type in task_type_list:
-            organic_tasks.extend(filter_tasks_by_type(task_results, task_type, is_organic=True))
-            synth_tasks.extend(filter_tasks_by_type(task_results, task_type, is_organic=False))
-
-        filtered_tasks[f"{task_types_key}_organic"] = organic_tasks
-        filtered_tasks[f"{task_types_key}_synth"] = synth_tasks
-
-
-    periods = {
-        "one_day": {"cutoff": datetime.now(timezone.utc) - timedelta(days=1), "weight": cts.ONE_DAY_SCORE_WEIGHT},
-        "three_day": {"cutoff": datetime.now(timezone.utc) - timedelta(days=3), "weight": cts.THREE_DAY_SCORE_WEIGHT},
-        "seven_day": {"cutoff": datetime.now(timezone.utc) - timedelta(days=7), "weight": cts.SEVEN_DAY_SCORE_WEIGHT},
-    }
-
-    all_period_scores = []
-
-    for period_name, period_config in periods.items():
-        cutoff = period_config["cutoff"]
-        period_weight = period_config["weight"]
-
-        for task_config in task_types:
-            raw_types = task_config["type"]
-            task_type_list = raw_types if isinstance(raw_types, set) else [raw_types]
-
-            weight_key = task_config["weight_key"]
-            task_weight = getattr(cts, weight_key)
-
-            task_types_key = str(sorted(task_type_list)) if len(task_type_list) > 1 else str(task_type_list[0])
-
-            organic_proportion = organic_proportions[task_types_key]
-            synth_proportion = 1 - organic_proportion
-
-            if organic_proportion > 0:
-                period_tasks_organic = filter_tasks_by_period(filtered_tasks[f"{task_types_key}_organic"], cutoff)
-                scores_organic = get_period_scores_from_results(
-                    period_tasks_organic, weight_multiplier=period_weight * task_weight * organic_proportion
-                )
-
-                for organic_score in scores_organic:
-                    if organic_score.hotkey in suspicious_hotkeys[task_types_key]:
-                        logger.info(
-                            f"Setting {task_types_key} organic score to zero for suspicious node {organic_score.hotkey} in {period_name} period"
-                        )
-                        organic_score.weight_multiplier = 0.0
-
-                all_period_scores.extend(scores_organic)
-
-            if synth_proportion > 0:
-                period_tasks_synth = filter_tasks_by_period(filtered_tasks[f"{task_types_key}_synth"], cutoff)
-                scores_synth = get_period_scores_from_results(
-                    period_tasks_synth, weight_multiplier=period_weight * task_weight * synth_proportion
-                )
-
-                all_period_scores.extend(scores_synth)
-
-    return all_period_scores
-
-
-def filter_tasks_by_period(tasks: list[TaskResults], cutoff_time: datetime) -> list[TaskResults]:
-    return [task for task in tasks if task.task.created_at > cutoff_time]
-
-
-def filter_tasks_by_type(tasks: list[TaskResults], task_type: TaskType, is_organic: bool | None = None) -> list[TaskResults]:
-    if is_organic is None:
-        return [task for task in tasks if task.task.task_type == task_type]
-    return [task for task in tasks if task.task.task_type == task_type and task.task.is_organic == is_organic]
-
-
-async def _get_weights_to_set(config: Config) -> tuple[list[PeriodScore], list[TaskResults]]:
-    """
-    Retrieve task results from the database and score multiple periods independently.
-    This ensures a fairer ramp-up for new miners.
-
-    In the future, as miners become more stable, we aim to encourage long-term stability.
-    This means not giving new miners more weight than necessary, while still allowing them
-    the potential to reach the top position without being deregistered.
-
-    Period scores are calculated completely independently
-    """
-    date = datetime.now() - timedelta(days=cts.SCORING_WINDOW)
-    task_results: list[TaskResults] = await get_aggregate_scores_since(date, config.psql_db)
-
-    all_period_scores = get_period_scores_from_task_results(task_results)
-
-    return all_period_scores, task_results
-
-
-async def _get_leaderboard_data(config: Config) -> tuple[list[PeriodScore], list[TaskResults]]:
-    """
-    Retrieve task results from the database for leaderboard/analytics purposes.
-    This includes ALL scores (including zeros) for accurate counting and statistics.
-    This is separate from _get_weights_to_set which filters for weight calculations.
-    """
-    date = datetime.now() - timedelta(days=cts.SCORING_WINDOW)
-    task_results: list[TaskResults] = await get_aggregate_scores_for_leaderboard_since(date, config.psql_db)
-
-    all_period_scores = get_period_scores_from_task_results(task_results)
-
-    return all_period_scores, task_results
-
-async def _upload_results_to_s3(
-    config: Config, task_results: list[TaskResults], tournament_audit_data: TournamentAuditData
-) -> None:
+async def _upload_results_to_s3(config: Config, tournament_audit_data: TournamentAuditData) -> None:
     class DateTimeEncoder(json.JSONEncoder):
         def default(self, obj):
             if isinstance(obj, datetime):
@@ -310,7 +61,6 @@ async def _upload_results_to_s3(
             return super().default(obj)
 
     upload_data = {
-        "task_results": [result.model_dump() for result in task_results],
         "tournament_audit_data": tournament_audit_data.model_dump(),
     }
 
@@ -324,550 +74,518 @@ async def _upload_results_to_s3(
     return presigned_url
 
 
-def get_miner_performance_breakdown(hotkey: str, task_results: list[TaskResults]) -> dict:
-    """Get detailed performance breakdown for a specific miner"""
-
-    task_type_configs = [
-        {"type": {TaskType.INSTRUCTTEXTTASK, TaskType.CHATTASK}, "weight_key": "INSTRUCT_TEXT_TASK_SCORE_WEIGHT"},
-        {"type": TaskType.DPOTASK, "weight_key": "DPO_TASK_SCORE_WEIGHT"},
-        {"type": TaskType.IMAGETASK, "weight_key": "IMAGE_TASK_SCORE_WEIGHT"},
-        {"type": TaskType.GRPOTASK, "weight_key": "GRPO_TASK_SCORE_WEIGHT"},
-    ]
-
-    periods = {
-        "one_day": {"cutoff": datetime.now(timezone.utc) - timedelta(days=1), "weight": cts.ONE_DAY_SCORE_WEIGHT},
-        "three_day": {"cutoff": datetime.now(timezone.utc) - timedelta(days=3), "weight": cts.THREE_DAY_SCORE_WEIGHT},
-        "seven_day": {"cutoff": datetime.now(timezone.utc) - timedelta(days=7), "weight": cts.SEVEN_DAY_SCORE_WEIGHT},
-    }
-
-    organic_proportions = {}
-    suspicious_hotkeys = {}
-
-    for task_config in task_type_configs:
-        raw_types = task_config["type"]
-        task_type_list = raw_types if isinstance(raw_types, set) else [raw_types]
-
-        task_types_key = str(sorted(task_type_list)) if len(task_type_list) > 1 else str(task_type_list[0])
-
-        organic_proportions[task_types_key] = get_organic_proportion(
-            task_results, set(task_type_list) if len(task_type_list) > 1 else task_type_list[0], days=7
-        )
-        suspicious_hotkeys[task_types_key] = detect_suspicious_nodes(
-            task_results, set(task_type_list) if len(task_type_list) > 1 else task_type_list[0], days=7
-        )
-
-
-    breakdown = {"task_types": {}, "period_totals": {}, "all_scores": []}
-
-    for task_config in task_type_configs:
-        raw_types = task_config["type"]
-        task_type_list = raw_types if isinstance(raw_types, set) else [raw_types]
-
-        task_weight = getattr(cts, task_config["weight_key"])
-
-        task_types_key = str(sorted(task_type_list)) if len(task_type_list) > 1 else str(task_type_list[0])
-
-        organic_tasks = []
-        synthetic_tasks = []
-        for task_type in task_type_list:
-            organic_tasks.extend(filter_tasks_by_type(task_results, task_type, is_organic=True))
-            synthetic_tasks.extend(filter_tasks_by_type(task_results, task_type, is_organic=False))
-
-        miner_organic_tasks = [tr for tr in organic_tasks if any(ns.hotkey == hotkey for ns in tr.node_scores)]
-        miner_synthetic_tasks = [tr for tr in synthetic_tasks if any(ns.hotkey == hotkey for ns in tr.node_scores)]
-
-        type_data = {
-            "task_weight": task_weight,
-            "organic_proportion": organic_proportions[task_types_key],
-            "is_suspicious": hotkey in suspicious_hotkeys[task_types_key],
-
-            "periods": {},
-
-        }
-
-        for period_name, period_config in periods.items():
-            period_weight = period_config["weight"]
-            cutoff = period_config["cutoff"]
-
-            period_organic = filter_tasks_by_period(miner_organic_tasks, cutoff)
-            period_synthetic = filter_tasks_by_period(miner_synthetic_tasks, cutoff)
-
-            organic_mult = period_weight * task_weight * organic_proportions[task_types_key]
-            synth_mult = period_weight * task_weight * (1 - organic_proportions[task_types_key])
-
-
-            organic_scores = (
-                get_period_scores_from_results(period_organic, weight_multiplier=organic_mult) if period_organic else []
-            )
-            synth_scores = (
-                get_period_scores_from_results(period_synthetic, weight_multiplier=synth_mult) if period_synthetic else []
-            )
-
-            miner_organic_score = next((s for s in organic_scores if s.hotkey == hotkey), None)
-            miner_synth_score = next((s for s in synth_scores if s.hotkey == hotkey), None)
-
-            if miner_organic_score and hotkey in suspicious_hotkeys[task_types_key]:
-                miner_organic_score.weight_multiplier = 0.0
-
-            type_data["periods"][period_name] = {
-                "organic": {
-                    "score": miner_organic_score,
-                    "task_count": len(period_organic),
-                    "weighted_contribution": (miner_organic_score.normalised_score * miner_organic_score.weight_multiplier)
-                    if miner_organic_score and miner_organic_score.normalised_score
-                    else 0,
-                },
-                "synthetic": {
-                    "score": miner_synth_score,
-                    "task_count": len(period_synthetic),
-                    "weighted_contribution": (miner_synth_score.normalised_score * miner_synth_score.weight_multiplier)
-                    if miner_synth_score and miner_synth_score.normalised_score
-                    else 0,
-                },
-            }
-
-            breakdown["all_scores"].extend([s for s in [miner_organic_score, miner_synth_score] if s])
-
-        type_data["total_organic_tasks"] = len(miner_organic_tasks)
-        type_data["total_synthetic_tasks"] = len(miner_synthetic_tasks)
-
-        breakdown["task_types"][task_types_key] = type_data
-
-        for period_name in periods:
-            total = sum(
-                breakdown["task_types"][tt]["periods"][period_name]["organic"]["weighted_contribution"]
-                + breakdown["task_types"][tt]["periods"][period_name]["synthetic"]["weighted_contribution"]
-
-                for tt in breakdown["task_types"]
-            )
-            breakdown["period_totals"][period_name] = total
-
-    return breakdown
-
-
-async def check_boss_round_synthetic_tasks_complete(tournament_id: str, psql_db) -> bool:
-    completion_data = await get_boss_round_synthetic_task_completion(tournament_id, psql_db)
-    return completion_data.total_synth_tasks > 0 and completion_data.total_synth_tasks == completion_data.completed_synth_tasks
-
-
-async def calculate_performance_difference(tournament_id: str, psql_db) -> float:
-    logger.info(f"=== CALCULATING PERFORMANCE DIFFERENCE FOR TOURNAMENT {tournament_id} ===")
-    task_pairs = await get_boss_round_winner_task_pairs(tournament_id, psql_db)
-    logger.info(f"Found {len(task_pairs)} task pairs for performance comparison")
-
-    if not task_pairs:
-        logger.info("No task pairs found, returning 0.0 performance difference")
+def calculate_emission_boost_from_perf(performance_diff: float | None) -> float:
+    if performance_diff is None:
+        logger.warning("performance_diff is None, cannot calculate emission boost.")
+        return 0.0
+    if performance_diff <= cts.EMISSION_MULTIPLIER_THRESHOLD:
         return 0.0
 
-    performance_differences = []
+    excess_performance = performance_diff - cts.EMISSION_MULTIPLIER_THRESHOLD
+    emission_increase = excess_performance * cts.EMISSION_MULTIPLIER_RATE
 
-    for i, task_pair in enumerate(task_pairs):
-        logger.info(f"Processing task pair {i+1}/{len(task_pairs)}: tournament={task_pair.tournament_task_id}, synthetic={task_pair.synthetic_task_id}, winner={task_pair.winner_hotkey}")
-        
-        tournament_scores = await get_task_scores_as_models(task_pair.tournament_task_id, psql_db)
-        synthetic_scores = await get_task_scores_as_models(task_pair.synthetic_task_id, psql_db)
-        logger.info(f"Found {len(tournament_scores)} tournament scores and {len(synthetic_scores)} synthetic scores")
+    return emission_increase
 
-        winner_tournament_score = None
-        best_synthetic_score = None
 
-        # Get the winner's score from the tournament task
-        for score in tournament_scores:
-            if score.hotkey == task_pair.winner_hotkey:
-                winner_tournament_score = max(score.test_loss, score.synth_loss)
-                logger.info(f"Winner tournament score for {task_pair.winner_hotkey}: {winner_tournament_score}")
-                break
-
-        # Get the best score from the synthetic task (from other miners)
-        if synthetic_scores:
-            # For lower-is-better metrics (loss), we want the minimum
-            # For higher-is-better metrics (GRPO), we want the maximum
-            task_type = TaskType(task_pair.task_type)
-            
-            if task_type == TaskType.GRPOTASK:
-                # GRPO: higher is better
-                best_synthetic_score = max(max(score.test_loss, score.synth_loss) for score in synthetic_scores)
-                logger.info(f"Best synthetic score (GRPO - higher is better): {best_synthetic_score}")
-            else:
-                # Other tasks: lower is better
-                best_synthetic_score = min(max(score.test_loss, score.synth_loss) for score in synthetic_scores)
-                logger.info(f"Best synthetic score (lower is better): {best_synthetic_score}")
-
-        if winner_tournament_score is not None and best_synthetic_score is not None:
-            task_type = TaskType(task_pair.task_type)
-            logger.info(f"Task type: {task_type}")
-            if task_type == TaskType.GRPOTASK:
-                # GRPO: higher is better
-                # If winner scored higher than best synthetic, it's an improvement
-                if best_synthetic_score > 0:
-                    performance_diff = (winner_tournament_score - best_synthetic_score) / best_synthetic_score
-                else:
-                    performance_diff = 0.0
-            else:
-                # Other tasks: lower is better (loss)
-                # If winner scored lower than best synthetic, it's an improvement
-                if winner_tournament_score > 0:
-                    performance_diff = (best_synthetic_score - winner_tournament_score) / winner_tournament_score
-                else:
-                    performance_diff = 0.0
-
-            logger.info(f"Performance difference for task pair {i+1}: {performance_diff}")
-            performance_differences.append(performance_diff)
+def calculate_tournament_weight_with_decay(
+    tournament_type: TournamentType,
+    base_weight: float,
+    emission_boost: float,
+    old_decay: float,
+    new_decay: float,
+    apply_hybrid: bool,
+    max_weight: float,
+) -> float:
+    """
+    Apply hybrid decay logic and return final capped tournament weight.
+    """
+    if apply_hybrid:
+        # Pre-cutoff: old_decay only affects emission_boost (emission doesn't go below base), then apply cumulative/max logic
+        boost_after_old = max(0.0, emission_boost - old_decay)
+        if boost_after_old == 0.0:
+            final_weight = max(0.0, base_weight - new_decay)
         else:
-            if winner_tournament_score is None and best_synthetic_score is not None:
-                # Winner didn't complete the task but synthetic miners did - apply max penalty
-                logger.warning(f"Winner {task_pair.winner_hotkey} has no score in tournament task but synthetic miners do - applying max burn reduction")
-                performance_diff = cts.MAX_BURN_REDUCTION / cts.BURN_REDUCTION_RATE  # This will result in max burn reduction
-                performance_differences.append(performance_diff)
-            else:
-                if winner_tournament_score is None:
-                    logger.warning(f"Could not find winner {task_pair.winner_hotkey} score in tournament task for pair {i+1}")
-                if best_synthetic_score is None:
-                    logger.warning(f"Could not find any scores in synthetic task for pair {i+1}")
+            final_weight = max(0.0, base_weight + boost_after_old)
+    else:
+        # Old regime purely
+        if old_decay > 0.0:
+            boost_after_old = max(0.0, emission_boost - old_decay)
+            final_weight = max(0.0, base_weight + boost_after_old)
+        # New regime purely, we will default to this after a while or if both winners change after cutoff
+        elif new_decay > 0.0:
+            final_weight = max(0.0, base_weight + emission_boost - new_decay)
+        else:
+            final_weight = base_weight + emission_boost
 
-    average_performance_diff = sum(performance_differences) / len(performance_differences) if performance_differences else 0.0
-    logger.info(f"Average performance difference: {average_performance_diff} from {len(performance_differences)} task pairs")
-    return average_performance_diff
+    final_weight = min(final_weight, max_weight)
 
+    logger.info(
+        f"{tournament_type}: base={base_weight:.4f} + boost={emission_boost:.4f}, "
+        f"old_decay={old_decay:.4f}, new_decay={new_decay:.4f}, "
+        f"apply_hybrid={apply_hybrid} → final={final_weight:.4f}"
+    )
 
-def calculate_burn_proportion(performance_diff: float) -> float:
-    if performance_diff <= 0:
-        return 0.0
-
-    burn_reduction = min(cts.MAX_BURN_REDUCTION, performance_diff * cts.BURN_REDUCTION_RATE)
-    return burn_reduction
-
-
-def calculate_weight_redistribution(performance_diff: float) -> tuple[float, float, float]:
-    burn_reduction = calculate_burn_proportion(performance_diff)
-    tournament_burn = cts.BASE_TOURNAMENT_WEIGHT * burn_reduction
-
-    tournament_weight = cts.BASE_TOURNAMENT_WEIGHT - tournament_burn
-    regular_weight = cts.BASE_REGULAR_WEIGHT + (tournament_burn * cts.LEGACY_PERFORM_DIFF_EMISSION_GAIN_PERCENT)
-    burn_weight = (1 - cts.BASE_REGULAR_WEIGHT - cts.BASE_TOURNAMENT_WEIGHT) + (tournament_burn * (1 - cts.LEGACY_PERFORM_DIFF_EMISSION_GAIN_PERCENT))
-
-    return tournament_weight, regular_weight, burn_weight
+    return final_weight
 
 
-async def get_active_tournament_burn_data(psql_db) -> tuple[float, float, float]:
-    from core.models.tournament_models import TournamentType
+def calculate_hybrid_decays(
+    first_championship_time: datetime, consecutive_wins: int, current_time: datetime | None = None
+) -> tuple[float, float, bool]:
+    """
+    Calculate time-based decay & previous consecutive wins decay for backwards compatibility.
+    Returns a tuple of (old_decay, new_decay, apply_hybrid).
+    """
+    if first_championship_time is None:
+        logger.error("First championship time is None, cannot calculate time-based decay.")
+        return (1.0, 1.0, False)
 
+    # timezone alignment
+    current_time_utc = current_time if current_time else datetime.now(timezone.utc)
+    if current_time_utc.tzinfo is None:
+        current_time_utc = current_time_utc.replace(tzinfo=timezone.utc)
+    cutoff_date = datetime.combine(cts.EMISSION_TIME_DECAY_START_DATE, datetime.min.time(), tzinfo=timezone.utc)
+    first_championship_time_utc = (
+        first_championship_time.replace(tzinfo=timezone.utc)
+        if first_championship_time.tzinfo is None
+        else first_championship_time
+    )
+
+    if current_time_utc < cutoff_date:
+        old_decay = max(0, consecutive_wins - 1) * cts.EMISSION_BOOST_DECAY_PER_WIN
+        return (old_decay, 0.0, False)
+
+    if first_championship_time_utc < cutoff_date:
+        old_decay = max(0, consecutive_wins - 1) * cts.EMISSION_BOOST_DECAY_PER_WIN
+        days_since_cutoff = (current_time_utc - cutoff_date).total_seconds() / cts.SECONDS_PER_DAY
+        new_decay = days_since_cutoff * cts.EMISSION_DAILY_TIME_DECAY_RATE
+
+        logger.debug(
+            f"Pre-cutoff champion: old_decay={old_decay:.4f}, new_decay={new_decay:.4f}, will apply hybrid logic downstream"
+        )
+        return (old_decay, new_decay, True)
+    else:
+        # Champion won AFTER cutoff - only new time-based decay
+        days_as_champion = (current_time_utc - first_championship_time_utc).total_seconds() / cts.SECONDS_PER_DAY
+        new_decay = days_as_champion * cts.EMISSION_DAILY_TIME_DECAY_RATE
+        logger.debug(f"Post-cutoff champion: new_decay={new_decay:.4f} (reign={days_as_champion:.1f} days)")
+        return (0.0, new_decay, False)
+
+
+def get_base_weight_by_tournament_type(tournament_type: TournamentType) -> float:
+    """Get the base weight for a tournament type."""
+    if tournament_type == TournamentType.TEXT:
+        return cts.TOURNAMENT_TEXT_WEIGHT
+    elif tournament_type == TournamentType.IMAGE:
+        return cts.TOURNAMENT_IMAGE_WEIGHT
+    else:
+        raise ValueError(f"Unknown tournament type: {tournament_type}")
+
+
+def get_max_weight_by_tournament_type(tournament_type: TournamentType) -> float:
+    """Get the max weight for a tournament type."""
+    if tournament_type == TournamentType.TEXT:
+        return cts.MAX_TEXT_TOURNAMENT_WEIGHT
+    elif tournament_type == TournamentType.IMAGE:
+        return cts.MAX_IMAGE_TOURNAMENT_WEIGHT
+    else:
+        raise ValueError(f"Unknown tournament type: {tournament_type}")
+
+
+def calculate_innovation_incentive(performance_diff: float | None) -> float:
+    """
+    Calculate innovation incentive based on performance difference.
+
+    Args:
+        performance_diff: Performance difference for the current champion
+
+    Returns:
+        Innovation incentive (emission boost based on performance)
+    """
+    return calculate_emission_boost_from_perf(performance_diff)
+
+
+async def get_tournament_burn_details(psql_db) -> TournamentBurnData:
+    """
+    Calculate detailed tournament burn data with calculations for TEXT and IMAGE tournaments.
+
+    This function calculates burn proportions for TEXT and IMAGE tournaments,
+    then applies them based on each hotkey's tournament participation.
+
+    Returns:
+        TournamentBurnData with performance metrics and weight distributions
+    """
     logger.info("=== CALCULATING TOURNAMENT BURN DATA ===")
-    weighted_performance_diff = 0.0
-    total_weight = 0.0
 
-    tournament_weights = {TournamentType.TEXT: cts.TOURNAMENT_TEXT_WEIGHT, TournamentType.IMAGE: cts.TOURNAMENT_IMAGE_WEIGHT}
-    logger.info(f"Tournament type weights: TEXT={cts.TOURNAMENT_TEXT_WEIGHT}, IMAGE={cts.TOURNAMENT_IMAGE_WEIGHT}")
+    text_performance_diff = None
+    image_performance_diff = None
 
-    for tournament_type, weight in tournament_weights.items():
+    for tournament_type in [TournamentType.TEXT, TournamentType.IMAGE]:
         logger.info(f"Processing {tournament_type} tournament type")
         performance_diff = None
 
         latest_tournament = await get_latest_completed_tournament(psql_db, tournament_type)
         if latest_tournament:
             logger.info(f"Found latest {tournament_type} tournament: {latest_tournament.tournament_id}")
-            synth_tasks_complete = await check_boss_round_synthetic_tasks_complete(latest_tournament.tournament_id, psql_db)
-            logger.info(f"Boss round synthetic tasks complete for {tournament_type}: {synth_tasks_complete}")
-            
-            if synth_tasks_complete:
-                performance_diff = await calculate_performance_difference(latest_tournament.tournament_id, psql_db)
-                logger.info(
-                    f"Using latest {tournament_type} tournament {latest_tournament.tournament_id} performance: {performance_diff}"
-                )
-            else:
-                previous_tournament_id = await get_previous_completed_tournament(
-                    psql_db, tournament_type, latest_tournament.tournament_id
-                )
-                if previous_tournament_id:
-                    if await check_boss_round_synthetic_tasks_complete(previous_tournament_id, psql_db):
-                        performance_diff = await calculate_performance_difference(previous_tournament_id, psql_db)
-                        logger.info(
-                            f"Using previous {tournament_type} tournament {previous_tournament_id} performance: {performance_diff}"
-                        )
-                    else:
-                        logger.info(
-                            f"Previous {tournament_type} tournament {previous_tournament_id} synthetic tasks not complete"
-                        )
-                else:
-                    logger.info(f"No previous {tournament_type} tournament found")
 
-        if performance_diff is not None:
-            weighted_performance_diff += performance_diff * weight
-            total_weight += weight
-        elif latest_tournament:
-            # Check if burn account won this tournament
+            previous_tournament = await get_latest_completed_tournament(
+                psql_db, tournament_type, exclude_tournament_id=latest_tournament.tournament_id
+            )
+
+            winner_changed = did_winner_change(previous_tournament, latest_tournament)
+
+            if winner_changed:
+                performance_diff = await calculate_performance_difference(latest_tournament.tournament_id, psql_db)
+                logger.info(f"NEW winner - calculated performance difference for {tournament_type}: {performance_diff:.4f}")
+            else:
+                # Champion defended - get performance from when they ACTUALLY won (not from a defense)
+                champion_hotkey = latest_tournament.base_winner_hotkey
+                if champion_hotkey:
+                    champion_win_tournament = await get_tournament_where_champion_first_won(
+                        psql_db, tournament_type, champion_hotkey
+                    )
+                    if champion_win_tournament:
+                        if champion_win_tournament.winning_performance_difference is not None:
+                            performance_diff = champion_win_tournament.winning_performance_difference
+                            logger.info(
+                                f"SAME winner - using stored performance difference from when {champion_hotkey} first won "
+                                f"(tournament {champion_win_tournament.tournament_id}): {performance_diff:.4f}"
+                            )
+                        else:
+                            performance_diff = 0.0
+                    else:
+                        logger.warning(f"Could not find tournament where {champion_hotkey} first won for {tournament_type}")
+                        performance_diff = 0.0
+                else:
+                    logger.warning(f"No base_winner_hotkey found for defending champion in {tournament_type}")
+                    performance_diff = 0.0
+
+        if performance_diff is None and latest_tournament:
             if latest_tournament.winner_hotkey == cts.EMISSION_BURN_HOTKEY:
                 logger.info(
-                    f"No synthetic task data available for {tournament_type} tournaments, burn account won - assuming worst performance (100% difference)"
+                    f"No performance data available for {tournament_type} tournament, "
+                    f"burn account won - assuming worst performance (100% difference)"
                 )
-                weighted_performance_diff += 1.0 * weight  # Maximum performance difference
+                performance_diff = 1.0
             else:
                 logger.info(
-                    f"No synthetic task data available for {tournament_type} tournaments, assuming perfect performance (0% difference)"
+                    f"No performance data available for {tournament_type} tournament, "
+                    f"assuming perfect performance (0% difference)"
                 )
-                weighted_performance_diff += 0.0 * weight
-            total_weight += weight
-        else:
-            logger.info(f"No {tournament_type} tournament data available, will burn this tournament allocation")
+                performance_diff = 0.0
 
-    if total_weight == 0:
-        logger.info("No tournament data available, burning entire tournament allocation")
-        tournament_burn = cts.BASE_TOURNAMENT_WEIGHT
-        tournament_weight = 0.0
-        regular_weight = cts.BASE_REGULAR_WEIGHT + (tournament_burn * cts.LEGACY_PERFORM_DIFF_EMISSION_GAIN_PERCENT)
-        burn_weight = (1 - cts.BASE_REGULAR_WEIGHT - cts.BASE_TOURNAMENT_WEIGHT) + (tournament_burn * (1 - cts.LEGACY_PERFORM_DIFF_EMISSION_GAIN_PERCENT))
-        return tournament_weight, regular_weight, burn_weight
+        if tournament_type == TournamentType.TEXT:
+            text_performance_diff = performance_diff
+        elif tournament_type == TournamentType.IMAGE:
+            image_performance_diff = performance_diff
 
-    average_performance_diff = weighted_performance_diff / total_weight
-    return calculate_weight_redistribution(average_performance_diff)
+    text_innovation_incentive = calculate_innovation_incentive(text_performance_diff)
+    image_innovation_incentive = calculate_innovation_incentive(image_performance_diff)
+
+    logger.info(f"[TEXT] innovation_incentive={text_innovation_incentive:.4f} (perf_diff={text_performance_diff})")
+    logger.info(f"[IMAGE] innovation_incentive={image_innovation_incentive:.4f} (perf_diff={image_performance_diff})")
+
+    text_consecutive_wins = 0
+    image_consecutive_wins = 0
+
+    latest_text_tournament = await get_latest_completed_tournament(psql_db, TournamentType.TEXT)
+    text_old_decay, text_new_decay, apply_hybrid_to_text = 0.0, 0.0, False
+    text_champion_hotkey = get_real_tournament_winner(latest_text_tournament)
+    if text_champion_hotkey:
+        text_consecutive_wins = await count_champion_consecutive_wins(psql_db, TournamentType.TEXT, text_champion_hotkey)
+        first_win_tournament = await get_tournament_where_champion_first_won(psql_db, TournamentType.TEXT, text_champion_hotkey)
+
+        text_old_decay, text_new_decay, apply_hybrid_to_text = calculate_hybrid_decays(
+            first_win_tournament.updated_at, text_consecutive_wins
+        )
+        logger.info(
+            f"Text champion {text_champion_hotkey[:8]}... has {text_consecutive_wins} consecutive wins, "
+            f"first won at {first_win_tournament.updated_at}, "
+            f"old_decay={text_old_decay:.4f}, new_decay={text_new_decay:.4f}, apply_hybrid={apply_hybrid_to_text}"
+        )
+
+    latest_image_tournament = await get_latest_completed_tournament(psql_db, TournamentType.IMAGE)
+    image_old_decay, image_new_decay, apply_hybrid_to_image = 0.0, 0.0, False
+    image_champion_hotkey = get_real_tournament_winner(latest_image_tournament)
+    if image_champion_hotkey:
+        image_consecutive_wins = await count_champion_consecutive_wins(psql_db, TournamentType.IMAGE, image_champion_hotkey)
+        first_win_tournament = await get_tournament_where_champion_first_won(psql_db, TournamentType.IMAGE, image_champion_hotkey)
+
+        image_old_decay, image_new_decay, apply_hybrid_to_image = calculate_hybrid_decays(
+            first_win_tournament.updated_at, image_consecutive_wins
+        )
+        logger.info(
+            f"Image champion {image_champion_hotkey[:8]}... has {image_consecutive_wins} consecutive wins, "
+            f"first won at {first_win_tournament.updated_at}, "
+            f"old_decay={image_old_decay:.4f}, new_decay={image_new_decay:.4f}, apply_hybrid={apply_hybrid_to_image}"
+        )
+
+    text_tournament_weight = calculate_tournament_weight_with_decay(
+        tournament_type=TournamentType.TEXT,
+        base_weight=cts.TOURNAMENT_TEXT_WEIGHT,
+        emission_boost=text_innovation_incentive,
+        old_decay=text_old_decay,
+        new_decay=text_new_decay,
+        apply_hybrid=apply_hybrid_to_text,
+        max_weight=cts.MAX_TEXT_TOURNAMENT_WEIGHT,
+    )
+
+    image_tournament_weight = calculate_tournament_weight_with_decay(
+        tournament_type=TournamentType.IMAGE,
+        base_weight=cts.TOURNAMENT_IMAGE_WEIGHT,
+        emission_boost=image_innovation_incentive,
+        old_decay=image_old_decay,
+        new_decay=image_new_decay,
+        apply_hybrid=apply_hybrid_to_image,
+        max_weight=cts.MAX_IMAGE_TOURNAMENT_WEIGHT,
+    )
+
+    burn_weight = 1.0 - text_tournament_weight - image_tournament_weight
+
+    text_burn_proportion = (cts.MAX_TEXT_TOURNAMENT_WEIGHT - text_tournament_weight) / cts.MAX_TEXT_TOURNAMENT_WEIGHT
+    image_burn_proportion = (cts.MAX_IMAGE_TOURNAMENT_WEIGHT - image_tournament_weight) / cts.MAX_IMAGE_TOURNAMENT_WEIGHT
+
+    logger.info(f"Weights - Text tournament: {text_tournament_weight}, Image tournament: {image_tournament_weight}")
+    logger.info(f"Total burn weight: {burn_weight}")
+
+    return TournamentBurnData(
+        text_performance_diff=text_performance_diff,
+        image_performance_diff=image_performance_diff,
+        text_burn_proportion=text_burn_proportion,
+        image_burn_proportion=image_burn_proportion,
+        text_tournament_weight=text_tournament_weight,
+        image_tournament_weight=image_tournament_weight,
+        burn_weight=burn_weight,
+    )
 
 
-async def get_node_weights_from_period_scores_with_tournament_data(
+def apply_tournament_weights(
+    text_tournament_weights: dict[str, float],
+    image_tournament_weights: dict[str, float],
+    hotkey_to_node_id: dict[str, int],
+    all_node_weights: list[float],
+    scaled_text_tournament_weight: float,
+    scaled_image_tournament_weight: float,
+    scaled_text_base_weight: float,
+    scaled_image_base_weight: float,
+    text_winner_hotkey: str | None,
+    image_winner_hotkey: str | None,
+) -> float:
+    """Apply tournament weights. Returns the total undistributed weight that should go to burn."""
+    logger.info("=== TOURNAMENT WEIGHT CALCULATIONS ===")
+
+    text_distributed = 0.0
+    logger.info(f"Processing {len(text_tournament_weights)} text tournament winners")
+    for hotkey, weight in text_tournament_weights.items():
+        node_id = hotkey_to_node_id.get(hotkey)
+        if node_id is not None:
+            if hotkey == text_winner_hotkey:
+                text_contribution = weight * scaled_text_tournament_weight
+            else:
+                text_contribution = weight * scaled_text_base_weight
+            all_node_weights[node_id] = all_node_weights[node_id] + text_contribution
+            text_distributed += text_contribution
+
+            logger.info(
+                f"Node ID {node_id} (hotkey: {hotkey[:8]}...): "
+                f"TEXT TOURNAMENT - weight={weight:.6f}, "
+                f"scaled_text_weight={scaled_text_tournament_weight if hotkey == text_winner_hotkey else scaled_text_base_weight:.6f}, "
+                f"text_contribution={text_contribution:.6f}, "
+                f"total_weight={all_node_weights[node_id]:.6f}"
+            )
+
+    text_undistributed = scaled_text_tournament_weight - text_distributed
+    logger.info(
+        f"Text tournament: allocated={scaled_text_tournament_weight:.10f}, distributed={text_distributed:.10f}, undistributed={text_undistributed:.10f}"
+    )
+
+    image_distributed = 0.0
+    logger.info(f"Processing {len(image_tournament_weights)} image tournament winners")
+    for hotkey, weight in image_tournament_weights.items():
+        node_id = hotkey_to_node_id.get(hotkey)
+        if node_id is not None:
+            if hotkey == image_winner_hotkey:
+                image_contribution = weight * scaled_image_tournament_weight
+            else:
+                image_contribution = weight * scaled_image_base_weight
+            all_node_weights[node_id] = all_node_weights[node_id] + image_contribution
+            image_distributed += image_contribution
+
+            logger.info(
+                f"Node ID {node_id} (hotkey: {hotkey[:8]}...): "
+                f"IMAGE TOURNAMENT - weight={weight:.6f}, "
+                f"scaled_image_weight={scaled_image_tournament_weight if hotkey == image_winner_hotkey else scaled_image_base_weight:.6f}, "
+                f"image_contribution={image_contribution:.6f}, "
+                f"total_weight={all_node_weights[node_id]:.6f}"
+            )
+
+    image_undistributed = scaled_image_tournament_weight - image_distributed
+    logger.info(
+        f"Image tournament: allocated={scaled_image_tournament_weight:.10f}, distributed={image_distributed:.10f}, undistributed={image_undistributed:.10f}"
+    )
+
+    total_undistributed = text_undistributed + image_undistributed
+    logger.info(f"Total undistributed weight to add to burn: {total_undistributed:.10f}")
+
+    return total_undistributed
+
+
+async def get_node_weights_from_tournament_audit_data(
     substrate: SubstrateInterface,
     netuid: int,
-    node_results: list[PeriodScore],
-    tournament_weights: dict[str, float],
-    participants: list[str],
-    tournament_weight_multiplier: float,
-    regular_weight_multiplier: float,
-    burn_weight: float,
-) -> tuple[list[int], list[float]]:
-    """
-    Get the node ids and weights from the node results with tournament data provided as arguments.
-    """
+    tournament_audit_data: TournamentAuditData,
+) -> NodeWeightsResult:
     all_nodes: list[Node] = fetch_nodes.get_nodes_for_netuid(substrate, netuid)
+    hotkey_to_node_id: dict[str, int] = {node.hotkey: node.node_id for node in all_nodes}
 
-    hotkey_to_node_id = {node.hotkey: node.node_id for node in all_nodes}
+    all_node_ids: list[int] = [node.node_id for node in all_nodes]
+    all_node_weights: list[float] = [0.0 for _ in all_nodes]
 
-    all_node_ids = [node.node_id for node in all_nodes]
-    all_node_weights = [0.0 for _ in all_nodes]
+    logger.info("=== USING BURN DATA FROM AUDIT ===")
 
-    logger.info("=== BURN CALCULATION ===")
-    logger.info(
-        f"Weight distribution: tournament={tournament_weight_multiplier:.6f}, regular={regular_weight_multiplier:.6f}, burn={burn_weight:.6f}"
+    logger.info(f"Text tournament weight: {tournament_audit_data.text_tournament_weight:.6f}")
+    logger.info(f"Image tournament weight: {tournament_audit_data.image_tournament_weight:.6f}")
+    logger.info(f"Total burn weight: {tournament_audit_data.burn_weight:.6f}")
+
+    # Check that base weights sum to 1.0
+    base_weight_sum = (
+        tournament_audit_data.text_tournament_weight
+        + tournament_audit_data.image_tournament_weight
+        + tournament_audit_data.burn_weight
+    )
+    logger.info(f"Base weights sum (text + image + burn): {base_weight_sum:.10f}")
+    logger.info(f"Base weights sum to 1.0? {abs(base_weight_sum - 1.0) < 0.0001}")
+
+    participants: list[str] = tournament_audit_data.participants
+    participation_total: float = len(participants) * cts.TOURNAMENT_PARTICIPATION_WEIGHT
+    scale_factor: float = 1.0 - participation_total if participation_total > 0 else 1.0
+
+    logger.info(f"Number of participants: {len(participants)}")
+    logger.info(f"Participation total weight: {participation_total:.10f}")
+    logger.info(f"Scale factor (1.0 - participation_total): {scale_factor:.10f}")
+
+    scaled_text_tournament_weight: float = tournament_audit_data.text_tournament_weight * scale_factor
+    scaled_image_tournament_weight: float = tournament_audit_data.image_tournament_weight * scale_factor
+    scaled_burn_weight: float = tournament_audit_data.burn_weight * scale_factor
+
+    scaled_text_base_weight: float = cts.TOURNAMENT_TEXT_WEIGHT * scale_factor
+    scaled_image_base_weight: float = cts.TOURNAMENT_IMAGE_WEIGHT * scale_factor
+
+    # Check that scaled weights + participation still sum to 1.0
+    scaled_weight_sum = scaled_text_tournament_weight + scaled_image_tournament_weight + scaled_burn_weight + participation_total
+    logger.info(f"Scaled weights sum (scaled_text + scaled_image + scaled_burn + participation): {scaled_weight_sum:.10f}")
+    logger.info(f"Scaled weights sum to 1.0? {abs(scaled_weight_sum - 1.0) < 0.0001}")
+
+    text_tournament_weights, image_tournament_weights = get_tournament_weights_from_data(
+        tournament_audit_data.text_tournament_data, tournament_audit_data.image_tournament_data
     )
 
-    # Calculate participation weights total and scale existing weights
-    participation_total = len(participants) * cts.TOURNAMENT_PARTICIPATION_WEIGHT
+    text_winner_hotkey = get_real_tournament_winner(tournament_audit_data.text_tournament_data)
+    image_winner_hotkey = get_real_tournament_winner(tournament_audit_data.image_tournament_data)
 
-    if participation_total > 0:
-        scale_factor = 1.0 - participation_total
-        tournament_weight_multiplier *= scale_factor
-        regular_weight_multiplier *= scale_factor
-        burn_weight *= scale_factor
-        logger.info(f"Scaled weights for {len(participants)} participants (total participation: {participation_total:.6f})")
-
-    logger.info(
-        f"Weight distribution: tournament={tournament_weight_multiplier:.6f}, regular={regular_weight_multiplier:.6f}, burn={burn_weight:.6f}, participation={participation_total:.6f}"
+    undistributed_weight = apply_tournament_weights(
+        text_tournament_weights,
+        image_tournament_weights,
+        hotkey_to_node_id,
+        all_node_weights,
+        scaled_text_tournament_weight,
+        scaled_image_tournament_weight,
+        scaled_text_base_weight,
+        scaled_image_base_weight,
+        text_winner_hotkey,
+        image_winner_hotkey,
     )
 
-    logger.info("=== NODE WEIGHT CALCULATIONS ===")
-    for node_result in node_results:
-        if node_result.normalised_score is not None:
-            node_id = hotkey_to_node_id.get(node_result.hotkey)
-            if node_id is not None:
-                contribution = node_result.normalised_score * node_result.weight_multiplier * regular_weight_multiplier
-                all_node_weights[node_id] = all_node_weights[node_id] + contribution
-                logger.info(
-                    f"Node ID {node_id} (hotkey: {node_result.hotkey[:8]}...): "
-                    f"normalized_score={node_result.normalised_score:.6f}, "
-                    f"weight_multiplier={node_result.weight_multiplier:.6f}, "
-                    f"regular_multiplier={regular_weight_multiplier:.6f}, "
-                    f"contribution={contribution:.6f}, "
-                    f"total_weight={all_node_weights[node_id]:.6f}"
-                )
+    # Check sum after tournament weights applied
+    weight_sum_after_tournament = sum(all_node_weights)
+    logger.info(f"Weight sum after tournament weights applied: {weight_sum_after_tournament:.10f}")
 
-    logger.info("=== TOURNAMENT WEIGHT CALCULATIONS ===")
-    logger.info(f"Tournament weights provided: {tournament_weights}")
-    logger.info(f"Tournament weights length: {len(tournament_weights)}")
-    if tournament_weights:
-        for hotkey, weight in tournament_weights.items():
-            node_id = hotkey_to_node_id.get(hotkey)
-            if node_id is not None:
-                tournament_contribution = weight * tournament_weight_multiplier
-                all_node_weights[node_id] = all_node_weights[node_id] + tournament_contribution
-                logger.info(
-                    f"Node ID {node_id} (hotkey: {hotkey[:8]}...): "
-                    f"tournament_weight={weight:.6f}, "
-                    f"tournament_multiplier={tournament_weight_multiplier:.6f}, "
-                    f"tournament_contribution={tournament_contribution:.6f}, "
-                    f"total_weight={all_node_weights[node_id]:.6f}"
-                )
-    else:
-        logger.info("No tournament weights found")
+    for hotkey in participants:
+        node_id = hotkey_to_node_id.get(hotkey)
+        if node_id is not None:
+            all_node_weights[node_id] += cts.TOURNAMENT_PARTICIPATION_WEIGHT
 
-    logger.info("=== PARTICIPATION WEIGHT ALLOCATION ===")
-    if participants:
-        for hotkey in participants:
-            node_id = hotkey_to_node_id.get(hotkey)
-            if node_id is not None:
-                participation_contribution = cts.TOURNAMENT_PARTICIPATION_WEIGHT
-                all_node_weights[node_id] = all_node_weights[node_id] + participation_contribution
-                logger.info(
-                    f"Node ID {node_id} (hotkey: {hotkey[:8]}...): "
-                    f"participation_weight={participation_contribution:.6f}, "
-                    f"total_weight={all_node_weights[node_id]:.6f}"
-                )
-    else:
-        logger.info("No tournament participants found")
+    # Check sum after participation weights added
+    weight_sum_after_participation = sum(all_node_weights)
+    logger.info(f"Weight sum after participation weights added: {weight_sum_after_participation:.10f}")
 
-    logger.info("=== BURN WEIGHT ALLOCATION ===")
-    burn_node_id = hotkey_to_node_id.get(cts.EMISSION_BURN_HOTKEY)
+    # Add undistributed tournament weight to burn.
+    # Undistributed weight comes from the gap between the boosted allocation and what's
+    # actually distributed (winner gets boost, non-winners capped at base weight).
+    # This ensures total weights sum to exactly 1.0.
+    burn_node_id: int | None = hotkey_to_node_id.get(cts.EMISSION_BURN_HOTKEY)
     if burn_node_id is not None:
-        all_node_weights[burn_node_id] = burn_weight
-        logger.info(f"Burn Node ID {burn_node_id} (hotkey: {cts.EMISSION_BURN_HOTKEY[:8]}...): burn_weight={burn_weight:.6f}")
-    else:
-        logger.warning(f"Burn hotkey {cts.EMISSION_BURN_HOTKEY} not found in network nodes")
+        all_node_weights[burn_node_id] = scaled_burn_weight + undistributed_weight
+        logger.info(
+            f"Burn weight: base={scaled_burn_weight:.10f} + undistributed={undistributed_weight:.10f} = total={all_node_weights[burn_node_id]:.10f}"
+        )
 
-    logger.info("=== FINAL NODE WEIGHTS ===")
-    for node_id, weight in enumerate(all_node_weights):
-        if weight > 0:
-            logger.info(f"Node ID {node_id}: final_weight={weight:.6f}")
-
-    logger.info(f"Node ids: {all_node_ids}")
-    logger.info(f"Node weights: {all_node_weights}")
+    # Final weight sum check
+    final_weight_sum = sum(all_node_weights)
+    logger.info(f"=== FINAL WEIGHT SUM CHECK ===")
+    logger.info(f"Total weight sum (before normalization): {final_weight_sum:.10f}")
+    logger.info(f"Expected: 1.0")
+    logger.info(f"Difference from 1.0: {abs(final_weight_sum - 1.0):.10f}")
+    logger.info(f"Weights sum to 1.0? {abs(final_weight_sum - 1.0) < 0.0001}")
     logger.info(f"Number of non zero node weights: {sum(1 for weight in all_node_weights if weight != 0)}")
-    logger.info(f"Everything going in is {all_node_ids} {all_node_weights} {netuid} {ccst.VERSION_KEY}")
-    return all_node_ids, all_node_weights
+
+    if abs(final_weight_sum - 1.0) >= 0.0001:
+        logger.warning(f"⚠️  WARNING: Weights DO NOT sum to 1.0! Sum is {final_weight_sum:.10f}")
+    else:
+        logger.info(f"✅ Weights correctly sum to 1.0")
+
+    return NodeWeightsResult(node_ids=all_node_ids, node_weights=all_node_weights)
 
 
-async def get_node_weights_from_period_scores(
-    substrate: SubstrateInterface, netuid: int, node_results: list[PeriodScore], psql_db
-) -> tuple[list[int], list[float]]:
+async def build_tournament_audit_data(psql_db) -> TournamentAuditData:
     """
-    Get the node ids and weights from the node results.
+    Build TournamentAuditData with all necessary tournament information.
+
+    This is the central function for gathering tournament data used by both
+    the validator (for weight setting) and auditor (for verification).
+
+    Args:
+        psql_db: Database connection
+
+    Returns:
+        TournamentAuditData with all tournament information populated
     """
-    all_nodes: list[Node] = fetch_nodes.get_nodes_for_netuid(substrate, netuid)
+    tournament_audit_data = TournamentAuditData()
 
-    hotkey_to_node_id = {node.hotkey: node.node_id for node in all_nodes}
-
-    all_node_ids = [node.node_id for node in all_nodes]
-    all_node_weights = [0.0 for _ in all_nodes]
-
-
-    logger.info("=== BURN CALCULATION ===")
-    tournament_weight_multiplier, regular_weight_multiplier, burn_weight = await get_active_tournament_burn_data(psql_db)
-
-    # Calculate participation weights total and scale existing weights
-    participants = await get_active_tournament_participants(psql_db)
-    participation_total = len(participants) * cts.TOURNAMENT_PARTICIPATION_WEIGHT
-
-    if participation_total > 0:
-        scale_factor = 1.0 - participation_total
-        tournament_weight_multiplier *= scale_factor
-        regular_weight_multiplier *= scale_factor
-        burn_weight *= scale_factor
-        logger.info(f"Scaled weights for {len(participants)} participants (total participation: {participation_total:.6f})")
-
-    logger.info(
-        f"Weight distribution: tournament={tournament_weight_multiplier:.6f}, regular={regular_weight_multiplier:.6f}, burn={burn_weight:.6f}, participation={participation_total:.6f}"
-    )
-
-
-    logger.info("=== NODE WEIGHT CALCULATIONS ===")
-    for node_result in node_results:
-        if node_result.normalised_score is not None:
-            node_id = hotkey_to_node_id.get(node_result.hotkey)
-            if node_id is not None:
-                contribution = node_result.normalised_score * node_result.weight_multiplier * regular_weight_multiplier
-                all_node_weights[node_id] = all_node_weights[node_id] + contribution
-                logger.info(
-                    f"Node ID {node_id} (hotkey: {node_result.hotkey[:8]}...): "
-                    f"normalized_score={node_result.normalised_score:.6f}, "
-                    f"weight_multiplier={node_result.weight_multiplier:.6f}, "
-                    f"regular_multiplier={regular_weight_multiplier:.6f}, "
-                    f"contribution={contribution:.6f}, "
-                    f"total_weight={all_node_weights[node_id]:.6f}"
-                )
-
-    logger.info("=== TOURNAMENT WEIGHT CALCULATIONS ===")
-
-    text_tournament = await get_latest_completed_tournament(psql_db, TournamentType.TEXT)
-    text_tournament_data = None
+    # Fetch text tournament data
+    text_tournament: TournamentData = await get_latest_completed_tournament(psql_db, TournamentType.TEXT)
     if text_tournament:
-        tournament_results = await get_tournament_full_results(text_tournament.tournament_id, psql_db)
-        text_tournament_data = TournamentResultsWithWinners(
+        tournament_results: TournamentResults = await get_tournament_full_results(text_tournament.tournament_id, psql_db)
+        tournament_audit_data.text_tournament_data = TournamentResultsWithWinners(
             tournament_id=tournament_results.tournament_id,
             rounds=tournament_results.rounds,
             base_winner_hotkey=text_tournament.base_winner_hotkey,
             winner_hotkey=text_tournament.winner_hotkey,
         )
 
+    # Fetch image tournament data
     image_tournament = await get_latest_completed_tournament(psql_db, TournamentType.IMAGE)
-    image_tournament_data = None
     if image_tournament:
         tournament_results = await get_tournament_full_results(image_tournament.tournament_id, psql_db)
-        image_tournament_data = TournamentResultsWithWinners(
+        tournament_audit_data.image_tournament_data = TournamentResultsWithWinners(
             tournament_id=tournament_results.tournament_id,
             rounds=tournament_results.rounds,
             base_winner_hotkey=image_tournament.base_winner_hotkey,
             winner_hotkey=image_tournament.winner_hotkey,
         )
 
-    tournament_weights = get_tournament_weights_from_data(text_tournament_data, image_tournament_data)
-    
-    # Apply tournament type weights if only one tournament type completed
-    if text_tournament_data and not image_tournament_data:
-        # Only text tournament - scale weights by text proportion
-        tournament_weights = {hotkey: weight * cts.TOURNAMENT_TEXT_WEIGHT for hotkey, weight in tournament_weights.items()}
-        logger.info(f"Only text tournament completed - scaled weights by {cts.TOURNAMENT_TEXT_WEIGHT}")
-    elif image_tournament_data and not text_tournament_data:
-        # Only image tournament - scale weights by image proportion  
-        tournament_weights = {hotkey: weight * cts.TOURNAMENT_IMAGE_WEIGHT for hotkey, weight in tournament_weights.items()}
-        logger.info(f"Only image tournament completed - scaled weights by {cts.TOURNAMENT_IMAGE_WEIGHT}")
+    # Fetch participants
+    tournament_audit_data.participants = await get_active_tournament_participants(psql_db)
 
-    logger.info(f"Tournament weights returned: {tournament_weights}")
-    logger.info(f"Tournament weights length: {len(tournament_weights)}")
-    if tournament_weights:
-        for hotkey, weight in tournament_weights.items():
-            node_id = hotkey_to_node_id.get(hotkey)
-            if node_id is not None:
-                tournament_contribution = weight * tournament_weight_multiplier
-                all_node_weights[node_id] = all_node_weights[node_id] + tournament_contribution
-                logger.info(
-                    f"Node ID {node_id} (hotkey: {hotkey[:8]}...): "
-                    f"tournament_weight={weight:.6f}, "
-                    f"tournament_multiplier={tournament_weight_multiplier:.6f}, "
-                    f"tournament_contribution={tournament_contribution:.6f}, "
-                    f"total_weight={all_node_weights[node_id]:.6f}"
-                )
-    else:
-        logger.info("No tournament weights found")
+    # Fetch burn weights
+    burn_data: TournamentBurnData = await get_tournament_burn_details(psql_db)
+    tournament_audit_data.text_tournament_weight = burn_data.text_tournament_weight
+    tournament_audit_data.image_tournament_weight = burn_data.image_tournament_weight
+    tournament_audit_data.burn_weight = burn_data.burn_weight
 
-    logger.info("=== PARTICIPATION WEIGHT ALLOCATION ===")
-    if participants:
-        for hotkey in participants:
-            node_id = hotkey_to_node_id.get(hotkey)
-            if node_id is not None:
-                participation_contribution = cts.TOURNAMENT_PARTICIPATION_WEIGHT
-                all_node_weights[node_id] = all_node_weights[node_id] + participation_contribution
-                logger.info(
-                    f"Node ID {node_id} (hotkey: {hotkey[:8]}...): "
-                    f"participation_weight={participation_contribution:.6f}, "
-                    f"total_weight={all_node_weights[node_id]:.6f}"
-                )
-    else:
-        logger.info("No tournament participants found")
+    # Fetch weekly participation data
+    tournament_audit_data.weekly_participation = await get_weekly_task_participation_data(psql_db)
 
-    logger.info("=== BURN WEIGHT ALLOCATION ===")
-    burn_node_id = hotkey_to_node_id.get(cts.EMISSION_BURN_HOTKEY)
-    if burn_node_id is not None:
-        all_node_weights[burn_node_id] = burn_weight
-        logger.info(f"Burn Node ID {burn_node_id} (hotkey: {cts.EMISSION_BURN_HOTKEY[:8]}...): burn_weight={burn_weight:.6f}")
-    else:
-        logger.warning(f"Burn hotkey {cts.EMISSION_BURN_HOTKEY} not found in network nodes")
-
-
-    logger.info("=== FINAL NODE WEIGHTS ===")
-    for node_id, weight in enumerate(all_node_weights):
-        if weight > 0:
-            logger.info(f"Node ID {node_id}: final_weight={weight:.6f}")
-
-    logger.info(f"Node ids: {all_node_ids}")
-    logger.info(f"Node weights: {all_node_weights}")
-    logger.info(f"Number of non zero node weights: {sum(1 for weight in all_node_weights if weight != 0)}")
-    logger.info(f"Everything going in is {all_node_ids} {all_node_weights} {netuid} {ccst.VERSION_KEY}")
-    return all_node_ids, all_node_weights
+    return tournament_audit_data
 
 
 async def set_weights(config: Config, all_node_ids: list[int], all_node_weights: list[float], validator_node_id: int) -> bool:
@@ -899,53 +617,18 @@ async def set_weights(config: Config, all_node_ids: list[int], all_node_weights:
 
 
 async def _get_and_set_weights(config: Config, validator_node_id: int) -> bool:
-    node_results, task_results = await _get_weights_to_set(config)
-    if node_results is None:
-        logger.info("No weights to set. Skipping weight setting.")
-        return False
-    if len(node_results) == 0:
-        logger.info("No nodes to set weights for. Skipping weight setting.")
-        return False
+    # Build tournament audit data using the centralized function
+    tournament_audit_data: TournamentAuditData = await build_tournament_audit_data(config.psql_db)
 
-    tournament_audit_data = TournamentAuditData()
-
-    text_tournament = await get_latest_completed_tournament(config.psql_db, TournamentType.TEXT)
-    if text_tournament:
-        tournament_results = await get_tournament_full_results(text_tournament.tournament_id, config.psql_db)
-        tournament_audit_data.text_tournament_data = TournamentResultsWithWinners(
-            tournament_id=tournament_results.tournament_id,
-            rounds=tournament_results.rounds,
-            base_winner_hotkey=text_tournament.base_winner_hotkey,
-            winner_hotkey=text_tournament.winner_hotkey,
-        )
-
-    image_tournament = await get_latest_completed_tournament(config.psql_db, TournamentType.IMAGE)
-    if image_tournament:
-        tournament_results = await get_tournament_full_results(image_tournament.tournament_id, config.psql_db)
-        tournament_audit_data.image_tournament_data = TournamentResultsWithWinners(
-            tournament_id=tournament_results.tournament_id,
-            rounds=tournament_results.rounds,
-            base_winner_hotkey=image_tournament.base_winner_hotkey,
-            winner_hotkey=image_tournament.winner_hotkey,
-        )
-
-    tournament_audit_data.participants = await get_active_tournament_participants(config.psql_db)
-
-    (
-        tournament_audit_data.tournament_weight_multiplier,
-        tournament_audit_data.regular_weight_multiplier,
-        tournament_audit_data.burn_weight,
-    ) = await get_active_tournament_burn_data(config.psql_db)
-
-    all_node_ids, all_node_weights = await get_node_weights_from_period_scores(
-        config.substrate, config.netuid, node_results, config.psql_db
-    )
+    result = await get_node_weights_from_tournament_audit_data(config.substrate, config.netuid, tournament_audit_data)
+    all_node_ids = result.node_ids
+    all_node_weights = result.node_weights
     logger.info("Weights calculated, about to set...")
 
     success = await set_weights(config, all_node_ids, all_node_weights, validator_node_id)
-    if success and task_results:
+    if success:
         # Upload both task results and tournament data
-        url = await _upload_results_to_s3(config, task_results, tournament_audit_data)
+        url = await _upload_results_to_s3(config, tournament_audit_data)
         logger.info(f"Uploaded the scores and tournament data to s3 for auditing - url: {url}")
 
     return success
@@ -972,9 +655,6 @@ async def _set_metagraph_weights(config: Config) -> None:
         wait_for_finalization=False,
         max_attempts=3,
     )
-
-
-#
 
 
 # To improve: use activity cutoff & The epoch length to set weights at the perfect times

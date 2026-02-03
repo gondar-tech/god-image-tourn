@@ -1,29 +1,27 @@
-import asyncio
 import re
 
-from datasets import get_dataset_infos
 from fiber import Keypair
 from huggingface_hub import HfApi
 
 from core.models.payload_models import TrainRequestImage
 from core.models.payload_models import TrainRequestText
-from core.models.utility_models import DpoDatasetType
 from core.models.utility_models import ChatTemplateDatasetType
+from core.models.utility_models import DpoDatasetType
 from core.models.utility_models import FileFormat
 from core.models.utility_models import GrpoDatasetType
 from core.models.utility_models import InstructTextDatasetType
 from core.models.utility_models import TaskStatus
 from validator.core import constants as cst
 from validator.core.models import AnyTextTypeRawTask
+from validator.core.models import ChatRawTask
 from validator.core.models import DpoRawTask
 from validator.core.models import GrpoRawTask
 from validator.core.models import ImageRawTask
-from validator.core.models import ChatRawTask
 from validator.core.models import InstructTextRawTask
 from validator.tasks.task_prep import prepare_image_task
 from validator.tasks.task_prep import prepare_text_task
 from validator.utils.logging import get_logger
-from validator.utils.minio import async_minio_client
+from validator.utils.yarn_extension import prepare_yarn_extended_model
 
 
 logger = get_logger(__name__)
@@ -32,29 +30,6 @@ hf_api = HfApi()
 
 async def get_fake_text_dataset_size(task: AnyTextTypeRawTask) -> int:
     return 100_000
-
-
-async def get_total_text_dataset_size(task: AnyTextTypeRawTask) -> int:
-    if task.file_format == FileFormat.S3:
-        if not task.training_data:
-            logger.error(f"Training data is missing from task: {task.task_id}")
-            raise ValueError(f"Training data is missing from task: {task.task_id}")
-        train_bucket_name, train_object_name = async_minio_client.parse_s3_url(task.training_data)
-        train_stats = await async_minio_client.get_stats(train_bucket_name, train_object_name)
-        train_ds_size = train_stats.size
-        if task.test_data:
-            test_bucket_name, test_object_name = async_minio_client.parse_s3_url(task.test_data)
-            test_stats = await async_minio_client.get_stats(test_bucket_name, test_object_name)
-            test_ds_size = test_stats.size
-            return train_ds_size + test_ds_size
-        else:
-            return train_ds_size
-
-    else:
-        loop = asyncio.get_running_loop()
-        dataset_infos = await loop.run_in_executor(None, get_dataset_infos, task.ds)
-        size = sum(info.dataset_size for info in dataset_infos.values() if info.dataset_size)
-    return int(size)
 
 
 def get_model_num_params(model_id: str) -> int:
@@ -76,7 +51,7 @@ async def get_total_image_dataset_size(task: ImageRawTask) -> int:
     return len(task.image_text_pairs)
 
 
-async def run_image_task_prep(task: ImageRawTask, keypair: Keypair) -> ImageRawTask:
+async def run_image_task_prep(task: ImageRawTask, keypair: Keypair, psql_db=None) -> ImageRawTask:
     test_url, train_url = await prepare_image_task(task.image_text_pairs)
     task.training_data = train_url
     task.test_data = test_url
@@ -87,21 +62,23 @@ async def run_image_task_prep(task: ImageRawTask, keypair: Keypair) -> ImageRawT
     return task
 
 
-async def run_text_task_prep(task: AnyTextTypeRawTask, keypair: Keypair) -> AnyTextTypeRawTask:
-    # Store original dataset name for processing
-    original_ds_name = task.ds
+async def run_text_task_prep(task: AnyTextTypeRawTask, keypair: Keypair, psql_db=None) -> AnyTextTypeRawTask:
+    if task.yarn_factor is not None:
+        logger.info(f"Applying YaRN extension with factor {task.yarn_factor} to model {task.model_id}")
+        try:
+            yarn_model_id = await prepare_yarn_extended_model(task.model_id, task.yarn_factor)
+            task.model_id = yarn_model_id
+            logger.info(f"YaRN extension applied, new model_id: {yarn_model_id}")
+        except Exception as e:
+            logger.error(f"Failed to apply YaRN extension: {e}, using original model")
+            # Clear yarn_factor to indicate extension was not applied
+            task.yarn_factor = None
 
-    test_data, synth_data, train_data = await prepare_text_task(task, keypair=keypair)
+    test_data, train_data = await prepare_text_task(task, keypair=keypair, psql_db=psql_db)
     task.training_data = train_data
     task.status = TaskStatus.LOOKING_FOR_NODES
-    task.synthetic_data = synth_data
+    task.synthetic_data = None  # TODO: remove from db schema
     task.test_data = test_data
-
-    # Update dataset name after processing if multiple datasets were used
-    if original_ds_name and "," in original_ds_name:
-        num_datasets = len([ds.strip() for ds in original_ds_name.split(",")])
-        task.ds = f"mix of {num_datasets} datasets"
-        logger.info(f"Updated dataset name from '{original_ds_name}' to: {task.ds}")
 
     if isinstance(task, InstructTextRawTask):
         task.field_instruction = cst.STANDARD_INSTRUCT_COLUMN
@@ -144,6 +121,7 @@ def prepare_text_task_request(task: AnyTextTypeRawTask) -> TrainRequestText:
         dataset_type = GrpoDatasetType(
             field_prompt=task.field_prompt,
             reward_functions=task.reward_functions,
+            extra_column=task.extra_column,
         )
     elif isinstance(task, ChatRawTask):
         dataset_type = ChatTemplateDatasetType(

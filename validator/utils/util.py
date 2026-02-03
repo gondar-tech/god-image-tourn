@@ -1,4 +1,5 @@
 import json
+import math
 import os
 import tempfile
 
@@ -9,6 +10,7 @@ from tenacity import stop_after_attempt
 from tenacity import wait_exponential
 
 from core.models.payload_models import AnyTypeTaskDetails
+from core.models.payload_models import ChatTaskDetails
 from core.models.payload_models import DpoTaskDetails
 from core.models.payload_models import GrpoTaskDetails
 from core.models.payload_models import ImageTaskDetails
@@ -18,7 +20,6 @@ from core.models.utility_models import TaskType
 from validator.core.config import Config
 from validator.core.models import AnyTypeTask
 from validator.core.models import ImageTextPair
-from validator.core.models import TaskType
 from validator.utils.logging import get_logger
 from validator.utils.minio import async_minio_client
 
@@ -103,6 +104,27 @@ def convert_task_to_task_details(task: AnyTypeTask) -> AnyTypeTaskDetails:
             task_type=task.task_type,
             result_model_name=task.result_model_name,
         )
+    elif task.task_type == TaskType.CHATTASK:
+        return ChatTaskDetails(
+            id=task.task_id,
+            account_id=task.account_id,
+            status=task.status,
+            base_model_repository=task.model_id,
+            ds_repo=task.ds,
+            chat_template=task.chat_template,
+            chat_column=task.chat_column,
+            chat_role_field=task.chat_role_field,
+            chat_content_field=task.chat_content_field,
+            chat_user_reference=task.chat_user_reference,
+            chat_assistant_reference=task.chat_assistant_reference,
+            created_at=task.created_at,
+            started_at=task.started_at,
+            finished_at=task.termination_at,
+            hours_to_complete=task.hours_to_complete,
+            trained_model_repository=task.trained_model_repository,
+            task_type=task.task_type,
+            result_model_name=task.result_model_name,
+        )
     elif task.task_type == TaskType.IMAGETASK:
         return ImageTaskDetails(
             id=task.task_id,
@@ -110,6 +132,7 @@ def convert_task_to_task_details(task: AnyTypeTask) -> AnyTypeTaskDetails:
             status=task.status,
             base_model_repository=task.model_id,
             image_text_pairs=task.image_text_pairs,
+            model_type=task.model_type,
             created_at=task.created_at,
             started_at=task.started_at,
             finished_at=task.termination_at,
@@ -170,8 +193,6 @@ def is_task_in_flight(task: AnyTypeTask) -> bool:
 
 def hide_sensitive_data_till_finished(task: AnyTypeTask) -> AnyTypeTask:
     if is_task_in_flight(task):
-        if task.task_type in [TaskType.INSTRUCTTEXTTASK, TaskType.DPOTASK, TaskType.GRPOTASK]:
-            task.synthetic_data = None
         if task.task_type == TaskType.IMAGETASK:
             task.image_text_pairs = [ImageTextPair(image_url="hidden", text_url="hidden")]
         task.test_data = None
@@ -179,3 +200,15 @@ def hide_sensitive_data_till_finished(task: AnyTypeTask) -> AnyTypeTask:
         task.training_data = None
         task.ds = "Hidden"
     return task
+
+
+def normalise_float(float: float | None) -> float | None:
+    if float is None:
+        return 0.0
+
+    if math.isnan(float):
+        return None
+
+    if math.isinf(float):
+        float = 1e100 if float > 0 else -1e100
+    return float

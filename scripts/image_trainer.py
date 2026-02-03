@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Standalone script for image model training (SDXL or Flux)
+Standalone script for image model training (SDXL, Flux, Z-Image, Qwen-Image)
 """
 
 import argparse
@@ -8,9 +8,9 @@ import asyncio
 import os
 import subprocess
 import sys
-import yaml
 
 import toml
+import yaml
 
 
 # Add project root to python path to import modules
@@ -26,22 +26,14 @@ from core.dataset.prepare_diffusion_dataset import prepare_dataset
 from core.models.utility_models import ImageModelType
 
 
-def get_model_path(path: str) -> str:
-    if os.path.isdir(path):
-        files = [f for f in os.listdir(path) if os.path.isfile(os.path.join(path, f))]
-        if len(files) == 1 and files[0].endswith(".safetensors"):
-            return os.path.join(path, files[0])
-    return path
-
 def create_config(task_id, model_path, model_name, model_type, expected_repo_name, trigger_word: str | None = None):
     """Get the training data directory"""
     train_data_dir = train_paths.get_image_training_images_dir(task_id)
 
     """Create the diffusion config file"""
     config_template_path, is_style = train_paths.get_image_training_config_template_path(model_type, train_data_dir)
-
     is_ai_toolkit = model_type in [ImageModelType.Z_IMAGE.value, ImageModelType.QWEN_IMAGE.value]
-    
+
     if is_ai_toolkit:
         with open(config_template_path, "r") as file:
             config = yaml.safe_load(file)
@@ -56,8 +48,9 @@ def create_config(task_id, model_path, model_name, model_type, expected_repo_nam
                         process['training_folder'] = output_dir
                 
                 if 'datasets' in process:
+                    dataset_path = train_paths.get_image_training_images_dir(task_id)
                     for dataset in process['datasets']:
-                        dataset['folder_path'] = train_data_dir
+                        dataset['folder_path'] = dataset_path
 
                 if trigger_word:
                     process['trigger_word'] = trigger_word
@@ -65,9 +58,7 @@ def create_config(task_id, model_path, model_name, model_type, expected_repo_nam
         config_path = os.path.join(train_cst.IMAGE_CONTAINER_CONFIG_SAVE_PATH, f"{task_id}.yaml")
         save_config(config, config_path)
         print(f"Created ai-toolkit config at {config_path}", flush=True)
-        return config_path
     else:
-
         with open(config_template_path, "r") as file:
             config = toml.load(file)
 
@@ -189,14 +180,14 @@ def create_config(task_id, model_path, model_name, model_type, expected_repo_nam
         config_path = os.path.join(train_cst.IMAGE_CONTAINER_CONFIG_SAVE_PATH, f"{task_id}.toml")
         save_config_toml(config, config_path)
         print(f"Created config at {config_path}", flush=True)
-        return config_path
+    return config_path
 
 
 def run_training(model_type, config_path):
     print(f"Starting training with config: {config_path}", flush=True)
 
     is_ai_toolkit = model_type in [ImageModelType.Z_IMAGE.value, ImageModelType.QWEN_IMAGE.value]
-    
+
     if is_ai_toolkit:
         training_command = [
             "python3",
@@ -228,6 +219,7 @@ def run_training(model_type, config_path):
                 f"/app/sd-scripts/{model_type}_train_network.py",
                 "--config_file", config_path
             ]
+
     try:
         print("Starting training subprocess...\n", flush=True)
         process = subprocess.Popen(
@@ -261,7 +253,7 @@ async def main():
     parser.add_argument("--task-id", required=True, help="Task ID")
     parser.add_argument("--model", required=True, help="Model name or path")
     parser.add_argument("--dataset-zip", required=True, help="Link to dataset zip file")
-    parser.add_argument("--model-type", required=True, choices=["sdxl", "flux", "qwen-image", "z-image"], help="Model type")
+    parser.add_argument("--model-type", required=True, choices=["sdxl", "flux", "z-image", "qwen-image"], help="Model type")
     parser.add_argument("--expected-repo-name", help="Expected repository name")
     parser.add_argument("--trigger-word", help="Trigger word for the training")
     parser.add_argument("--hours-to-complete", type=float, required=True, help="Number of hours to complete the task")
@@ -291,7 +283,6 @@ async def main():
         args.model,
         args.model_type,
         args.expected_repo_name,
-        args.trigger_word
     )
 
     # Run training
